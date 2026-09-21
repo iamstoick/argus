@@ -1,57 +1,37 @@
-/** MCP server layer: registers the 4 dictionary tools over stdio transport. */
-import { join } from 'node:path';
+/** MCP layer: tool registration shared by the stdio and HTTP transports. */
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
-import { DB_FILENAME } from './config.js';
-import { ArgusDb } from './db.js';
-import { syncRoot, watchRoot } from './indexer.js';
-import { ParserEngine } from './parser.js';
+import type { IndexManager, ProjectEntry } from './projects.js';
 import { checkBlastRadius, getCodebaseMap, getSymbolDetails, lookupDictionary } from './tools.js';
 
-export interface ServerOptions {
-  /** Disable the live file watcher (one-shot sync, e.g. for CI). */
-  noWatch: boolean;
-  /** Version string reported to MCP clients. */
-  version: string;
-}
+type TextResult = { content: Array<{ type: 'text'; text: string }> };
 
-function toolResult(text: string): { content: Array<{ type: 'text'; text: string }> } {
+function toolResult(text: string): TextResult {
   return { content: [{ type: 'text', text }] };
 }
 
-function safe(handler: () => string, toolName: string): { content: Array<{ type: 'text'; text: string }> } {
+/** Resolve the project selector, then run the handler with failures as text. */
+function withProject(
+  manager: IndexManager,
+  toolName: string,
+  project: string | undefined,
+  fn: (entry: ProjectEntry) => string,
+): TextResult {
+  const resolved = manager.resolve(project);
+  if ('error' in resolved) return toolResult(resolved.error);
   try {
-    return toolResult(handler());
+    return toolResult(fn(resolved.entry));
   } catch (err) {
     return toolResult(`${toolName} failed: ${err instanceof Error ? err.message : String(err)}`);
   }
 }
 
-export async function runServer(root: string, options: ServerOptions): Promise<void> {
-  const db = new ArgusDb(join(root, DB_FILENAME));
-  const engine = await ParserEngine.create();
-  for (const [lang, reason] of engine.unavailableLanguages()) {
-    console.error(`[argus] grammar '${lang}' unavailable: ${reason}`);
-  }
+const projectField = z.string().optional().describe('Project name (required when several are configured)');
 
-  const stats = syncRoot(db, engine, root);
-  console.error(
-    `[argus] indexed ${root}: ${stats.scanned} files, ${stats.updated} updated, ` +
-      `${stats.removed} removed, ${stats.skipped} unchanged, ${stats.failed.length} failed`,
-  );
-
-  let watcher: { close: () => Promise<void> } | undefined;
-  if (!options.noWatch) {
-    const handle = watchRoot(db, engine, root, (err) => {
-      console.error(`[argus] watcher error: ${err instanceof Error ? err.message : String(err)}`);
-    });
-    await handle.ready;
-    watcher = handle.watcher;
-    console.error('[argus] watching for changes');
-  }
-
-  const server = new McpServer({ name: 'argus', version: options.version });
+/** Build an MCP server bound to the index manager (one instance per transport session). */
+export function createMcpServer(manager: IndexManager, version: string): McpServer {
+  const server = new McpServer({ name: 'argus', version });
 
   server.registerTool(
     'lookup_dictionary',
@@ -63,9 +43,13 @@ export async function runServer(root: string, options: ServerOptions): Promise<v
         query: z.string().describe('Name/signature fragment to search for'),
         kind: z.string().optional().describe('Filter by kind: function, class, method, interface, struct, enum, ...'),
         limit: z.number().optional().describe('Max results (default 50)'),
+        project: projectField,
       },
     },
-    (args) => Promise.resolve(safe(() => lookupDictionary(db, args), 'lookup_dictionary')),
+    (args) =>
+      Promise.resolve(
+        withProject(manager, 'lookup_dictionary', args.project, (entry) => lookupDictionary(entry.db, args)),
+      ),
   );
 
   server.registerTool(
@@ -75,9 +59,13 @@ export async function runServer(root: string, options: ServerOptions): Promise<v
       inputSchema: {
         module_path: z.string().optional().describe('Only include files under this path prefix'),
         limit: z.number().optional().describe('Max symbols (default 50)'),
+        project: projectField,
       },
     },
-    (args) => Promise.resolve(safe(() => getCodebaseMap(db, args), 'get_codebase_map')),
+    (args) =>
+      Promise.resolve(
+        withProject(manager, 'get_codebase_map', args.project, (entry) => getCodebaseMap(entry.db, args)),
+      ),
   );
 
   server.registerTool(
@@ -87,9 +75,15 @@ export async function runServer(root: string, options: ServerOptions): Promise<v
       inputSchema: {
         symbol_id: z.number().optional().describe('Symbol id from lookup_dictionary'),
         symbol_name: z.string().optional().describe('Symbol name (exact or closest match)'),
+        project: projectField,
       },
     },
-    (args) => Promise.resolve(safe(() => getSymbolDetails(db, root, args), 'get_symbol_details')),
+    (args) =>
+      Promise.resolve(
+        withProject(manager, 'get_symbol_details', args.project, (entry) =>
+          getSymbolDetails(entry.db, entry.root, args),
+        ),
+      ),
   );
 
   server.registerTool(
@@ -99,25 +93,20 @@ export async function runServer(root: string, options: ServerOptions): Promise<v
       inputSchema: {
         symbol_name: z.string().describe('Symbol name to trace'),
         limit: z.number().optional().describe('Max refs per direction (default 50)'),
+        project: projectField,
       },
     },
-    (args) => Promise.resolve(safe(() => checkBlastRadius(db, args), 'check_blast_radius')),
+    (args) =>
+      Promise.resolve(
+        withProject(manager, 'check_blast_radius', args.project, (entry) => checkBlastRadius(entry.db, args)),
+      ),
   );
 
-  const shutdown = (): void => {
-    void (async () => {
-      try {
-        await watcher?.close();
-      } finally {
-        engine.dispose();
-        db.close();
-      }
-      process.exit(0);
-    })();
-  };
-  process.on('SIGINT', shutdown);
-  process.on('SIGTERM', shutdown);
+  return server;
+}
 
-  await server.connect(new StdioServerTransport());
+/** Serve MCP over stdio (local agents). Blocks until the transport closes. */
+export async function runStdio(manager: IndexManager, version: string): Promise<void> {
+  await createMcpServer(manager, version).connect(new StdioServerTransport());
   console.error('[argus] MCP server ready on stdio');
 }

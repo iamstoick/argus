@@ -7,7 +7,7 @@
     "argus": "./dist/src/index.js"
   },
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && mkdir -p dist/src/admin && cp src/admin/index.html dist/src/admin/index.html",
     "start": "node dist/src/index.js",
     "dev": "node --experimental-strip-types src/index.ts",
     "test": "npm run build && node --test dist/tests/*.test.js",

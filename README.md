@@ -32,22 +32,46 @@ npm test      # 35 tests + 1 live-watcher test (skips where OS watching is block
 
 ## Run
 
-```bash
-# Index + serve the current directory
-node dist/src/index.js
+**Single project, local agent (stdio):**
 
-# Index + serve another workspace
+```bash
 node dist/src/index.js --root /path/to/project
 ARGUS_ROOT=/path/to/project node dist/src/index.js
-
-# One-shot sync without the live watcher (CI, restricted sandboxes)
-node dist/src/index.js --root /path/to/project --no-watch
+node dist/src/index.js --root /path/to/project --no-watch  # CI / restricted sandboxes
 ```
 
-The index lives at `<root>/.mcp-codebase.db` (plus `-wal`/`-shm` sidecars — gitignore them).
-Logs go to **stderr**; stdout carries the MCP stdio protocol. On startup the server runs a
-hash-delta sync (unchanged files are skipped), then watches for changes. Parse failures and
-watcher errors are logged, never fatal: the server keeps serving what it has.
+**Multi-project server (team / shared / admin):**
+
+```bash
+# argus.json: { "projects": [{ "name": "web", "path": "/srv/web" }] }
+ARGUS_TOKEN=$(openssl rand -hex 24) node dist/src/index.js serve --config argus.json
+node dist/src/index.js serve --root /path/to/project --port 3000   # solo, one project
+```
+
+Serve mode exposes, on one port:
+
+- `/mcp` — MCP over Streamable HTTP (remote agents)
+- `/` — admin web UI (observe: health, stats, search, details, blast radius)
+- `/api/*` — JSON API backing the admin UI
+
+All HTTP endpoints require `Authorization: Bearer <token>` when a token is set
+(`--token` or `ARGUS_TOKEN`; never put it in the config file). Binding a
+non-loopback address without a token is refused. Add `--stdio` to serve MCP over
+stdio alongside HTTP.
+
+Each project keeps its own `<root>/.mcp-codebase.db` index (plus `-wal`/`-shm`
+sidecars — gitignore them). Nothing is shared between projects. Logs go to
+**stderr**. On startup the server runs a hash-delta sync per project (unchanged
+files are skipped), then watches for changes. Parse failures and watcher errors
+are logged, never fatal: the server keeps serving what it has.
+
+## Deployment scenarios
+
+| Setup | How |
+|---|---|
+| Solo, local | `argus --root <project>` + stdio MCP entry |
+| Solo, share later | `argus serve` on your machine; teammates point their agent at your host (token required), or copy the `.mcp-codebase.db` files |
+| Distributed team | `argus serve --config argus.json` on a shared host with the repos checked out; every agent connects over Streamable HTTP; admin UI for visibility |
 
 ## Client setup
 
@@ -72,6 +96,25 @@ npm run build
 ```
 
 or via CLI: `Muse mcp add argus -- node /Users/gerald/Apps/argus/dist/src/index.js --root /path/to/project`
+
+**Remote agents against `serve` mode** — Streamable HTTP entry (Muse
+`~/.config/muse/settings.json`, or any MCP client with HTTP support):
+
+```json
+{
+  "mcpServers": {
+    "argus-team": {
+      "type": "streamable-http",
+      "url": "https://argus.internal:3000/mcp",
+      "headers": { "Authorization": "Bearer <team token>" },
+      "mode": "optional"
+    }
+  }
+}
+```
+
+With several projects configured, pass `"project": "<name>"` on every tool call
+(single-project servers default to it).
 
 **Cursor / Windsurf** (`.cursor/mcp.json` or equivalent):
 
@@ -135,13 +178,18 @@ precise. `node_modules`, `.git`, `dist`, `vendor`, `target`, `__pycache__`, etc.
 
 ```
 src/
-  index.ts    CLI entry (--root, --no-watch, --help)
-  server.ts   MCP server: tool registration + stdio transport
+  index.ts    CLI entry (stdio + serve orchestration)
+  cli.ts      Argument parsing (pure, tested)
+  server.ts   MCP tool registration + stdio transport
+  http.ts     HTTP: MCP Streamable, JSON API, admin page, token auth
+  admin/      Admin web UI (single static page, observe-only)
+  projects.ts Multi-project index manager (isolated DB + watcher per project)
   tools.ts    The 4 tool handlers
   indexer.ts  SHA-256 delta sync + chokidar watcher
   parser.ts   Tree-sitter engine: symbols, signatures, docstrings, refs
   queries.ts  S-expression query packs per language
-  config.ts   Language map, ignore rules, token budgets
+  config.ts   Language map, ignore rules, token budgets, argus.json parsing
   db.ts       SQLite schema + parameterized data access
-tests/        node:test suite (parser fixtures per language, db, indexer, tools, watcher)
+tests/        node:test suite (53 tests: parser fixtures, db, indexer, tools,
+              projects, config, http handler + live socket, watcher)
 ```

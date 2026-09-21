@@ -110,6 +110,75 @@ export function languageForPath(filePath: string): LanguageId | undefined {
   return EXTENSION_LANGUAGE.get(filePath.slice(dot).toLowerCase());
 }
 
+export interface ProjectSpec {
+  name: string;
+  path: string;
+}
+
+export interface ArgusConfig {
+  projects: ProjectSpec[];
+}
+
+/** Names travel in tool params and URLs: keep them tight. */
+const PROJECT_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
+
+export function isValidProjectName(name: string): boolean {
+  return PROJECT_NAME_RE.test(name) && name.length <= 64;
+}
+
+/** Parse and validate an argus.json config file. Relative paths resolve from its directory. */
+export function parseConfigFile(jsonText: string, configDir: string): ArgusConfig {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(jsonText) as unknown;
+  } catch {
+    throw new Error('config: invalid JSON');
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    throw new Error('config: top level must be an object with a "projects" array');
+  }
+  const projects = (parsed as Record<string, unknown>)['projects'];
+  if (!Array.isArray(projects) || projects.length === 0) {
+    throw new Error('config: "projects" must be a non-empty array');
+  }
+  const seen = new Set<string>();
+  const out: ProjectSpec[] = [];
+  for (const [i, entry] of projects.entries()) {
+    if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) {
+      throw new Error(`config: projects[${i}] must be an object with "name" and "path"`);
+    }
+    const rec = entry as Record<string, unknown>;
+    if (typeof rec['name'] !== 'string' || !isValidProjectName(rec['name'])) {
+      throw new Error(`config: projects[${i}].name must match ${PROJECT_NAME_RE.source} (<=64 chars)`);
+    }
+    if (typeof rec['path'] !== 'string' || rec['path'].trim() === '') {
+      throw new Error(`config: projects[${i}].path must be a non-empty string`);
+    }
+    if (seen.has(rec['name'])) throw new Error(`config: duplicate project name '${rec['name']}'`);
+    seen.add(rec['name']);
+    const rawPath = rec['path'].trim();
+    out.push({ name: rec['name'], path: rawPath.startsWith('/') ? rawPath : `${configDir}/${rawPath}` });
+  }
+  return { projects: out };
+}
+
+/** Shared bearer token for HTTP endpoints. Never read from config files. */
+export function resolveToken(argv: string[], env: NodeJS.ProcessEnv): string | undefined {
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === undefined) continue;
+    if (arg === '--token') {
+      const next = argv[i + 1];
+      if (next !== undefined && next !== '') return next;
+    } else if (arg.startsWith('--token=')) {
+      const value = arg.slice('--token='.length);
+      if (value !== '') return value;
+    }
+  }
+  const fromEnv = env['ARGUS_TOKEN'];
+  return fromEnv !== undefined && fromEnv !== '' ? fromEnv : undefined;
+}
+
 /** Resolve the indexed root: --root=… / --root … / ARGUS_ROOT / cwd. */
 export function resolveRoot(argv: string[], env: NodeJS.ProcessEnv): string {
   for (let i = 0; i < argv.length; i++) {

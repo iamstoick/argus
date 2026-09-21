@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Argus Admin</title>
+<style>
+  :root {
+    --bg: #f4f4f2;
+    --panel: #ffffff;
+    --ink: #1a1a1a;
+    --muted: #5c5c5c;
+    --line: #ddd9d2;
+    --accent: #0b5cad;
+    --ok: #1c7a3d;
+    --bad: #b3261e;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font: 14px/1.5 -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
+  }
+  header {
+    background: var(--panel);
+    border-bottom: 1px solid var(--line);
+    padding: 10px 20px;
+    display: flex;
+    gap: 16px;
+    align-items: center;
+    flex-wrap: wrap;
+  }
+  header h1 { font-size: 17px; margin: 0; font-weight: 650; }
+  header h1 span { color: var(--muted); font-weight: 400; font-size: 13px; }
+  header .spacer { flex: 1; }
+  label { color: var(--muted); font-size: 12px; margin-right: 4px; }
+  select, input[type="text"], input[type="password"] {
+    font: inherit;
+    padding: 5px 8px;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    background: #fff;
+    color: var(--ink);
+  }
+  button {
+    font: inherit;
+    padding: 5px 12px;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    background: var(--panel);
+    cursor: pointer;
+  }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button:disabled { opacity: 0.5; cursor: default; }
+  main { padding: 16px 20px 40px; max-width: 1100px; }
+  #status { font-size: 13px; margin: 0 0 12px; color: var(--muted); }
+  #status.ok { color: var(--ok); }
+  #status.err { color: var(--bad); }
+  .stats { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 16px; }
+  .stat {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 8px 14px;
+    min-width: 110px;
+  }
+  .stat .v { font-size: 20px; font-weight: 650; }
+  .stat .k { font-size: 12px; color: var(--muted); }
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 12px 14px;
+    margin-bottom: 16px;
+  }
+  .panel h2 { font-size: 14px; margin: 0 0 10px; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  .row input[type="text"] { flex: 1; min-width: 200px; }
+  table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 13px; }
+  th { text-align: left; color: var(--muted); font-weight: 600; font-size: 12px; padding: 4px 8px; border-bottom: 1px solid var(--line); }
+  td { padding: 5px 8px; border-bottom: 1px solid #eee; vertical-align: top; }
+  tr:last-child td { border-bottom: none; }
+  tbody tr:hover { background: #f7f7f5; }
+  tbody tr { cursor: pointer; }
+  code, .mono { font-family: var(--mono); font-size: 12.5px; }
+  .kind {
+    display: inline-block;
+    font-size: 11px;
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    padding: 0 6px;
+    color: var(--muted);
+    white-space: nowrap;
+  }
+  pre.code {
+    font-family: var(--mono);
+    font-size: 12.5px;
+    background: #f7f7f5;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 10px 12px;
+    overflow-x: auto;
+    white-space: pre;
+  }
+  .sig { font-family: var(--mono); font-size: 13px; margin: 6px 0; }
+  .doc { color: var(--muted); margin: 6px 0; }
+  .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  @media (max-width: 700px) { .cols { grid-template-columns: 1fr; } }
+  ul.refs { margin: 6px 0; padding-left: 18px; font-size: 13px; }
+  ul.refs li { margin: 2px 0; }
+  .hidden { display: none; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Argus <span>codebase dictionary · admin</span></h1>
+  <div class="spacer"></div>
+  <label for="project">Project</label>
+  <select id="project"></select>
+  <label for="token">Token</label>
+  <input type="password" id="token" size="18" placeholder="bearer token" autocomplete="off">
+  <button id="connect">Connect</button>
+</header>
+<main>
+  <p id="status">Enter the bearer token (if the server requires one) and press Connect.</p>
+
+  <section id="overview" class="hidden">
+    <div class="stats" id="stats"></div>
+    <div class="panel">
+      <h2>Search symbols</h2>
+      <div class="row">
+        <input type="text" id="q" placeholder="name or signature fragment">
+        <select id="kind">
+          <option value="">any kind</option>
+          <option>function</option><option>class</option><option>method</option>
+          <option>interface</option><option>struct</option><option>enum</option>
+          <option>trait</option><option>type</option><option>module</option>
+          <option>variable</option><option>constant</option>
+        </select>
+        <button class="primary" id="search">Search</button>
+      </div>
+      <div id="results"></div>
+    </div>
+    <div class="panel hidden" id="detailWrap">
+      <h2>Symbol details</h2>
+      <div id="detail"></div>
+    </div>
+  </section>
+</main>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const state = { projects: [], token: sessionStorage.getItem("argusToken") || "" };
+$("token").value = state.token;
+
+function headers() {
+  const h = {};
+  if (state.token) h["Authorization"] = "Bearer " + state.token;
+  return h;
+}
+
+async function api(path) {
+  const res = await fetch(path, { headers: headers() });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(body.error || ("HTTP " + res.status));
+  return body;
+}
+
+function setStatus(text, cls) {
+  const el = $("status");
+  el.textContent = text;
+  el.className = cls || "";
+}
+
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+
+async function connect() {
+  state.token = $("token").value.trim();
+  sessionStorage.setItem("argusToken", state.token);
+  setStatus("Connecting…");
+  try {
+    const data = await api("/api/projects");
+    state.projects = data.projects || [];
+    const sel = $("project");
+    sel.innerHTML = "";
+    for (const p of state.projects) {
+      const opt = document.createElement("option");
+      opt.value = p.name;
+      opt.textContent = p.name;
+      sel.appendChild(opt);
+    }
+    $("overview").classList.remove("hidden");
+    renderStats();
+    const n = state.projects.length;
+    setStatus(n === 1 ? "Connected: 1 project." : "Connected: " + n + " projects.", "ok");
+  } catch (e) {
+    $("overview").classList.add("hidden");
+    setStatus("Connection failed: " + e.message, "err");
+  }
+}
+
+function currentProject() {
+  return state.projects.find((p) => p.name === $("project").value);
+}
+
+function renderStats() {
+  const p = currentProject();
+  if (!p) return;
+  const sync = p.lastSync
+    ? p.lastSync.updated + " updated · " + p.lastSync.skipped + " unchanged · " + p.lastSync.failed.length + " failed"
+    : "never";
+  $("stats").innerHTML =
+    stat(p.files, "files") + stat(p.symbols, "symbols") + stat(p.relationships, "relationships") +
+    '<div class="stat"><div class="v" style="font-size:14px">' + esc(p.watching ? "watching" : "static") + '</div><div class="k">mode</div></div>' +
+    '<div class="stat"><div class="v" style="font-size:14px">' + esc(sync) + '</div><div class="k">last sync</div></div>' +
+    '<div class="stat"><div class="v mono" style="font-size:12px">' + esc(p.root) + '</div><div class="k">root</div></div>';
+}
+
+function stat(v, k) {
+  return '<div class="stat"><div class="v">' + esc(v) + '</div><div class="k">' + esc(k) + "</div></div>";
+}
+
+async function search() {
+  const q = $("q").value.trim();
+  if (!q) return;
+  const project = $("project").value;
+  const kind = $("kind").value;
+  setStatus("Searching…");
+  $("detailWrap").classList.add("hidden");
+  try {
+    const params = new URLSearchParams({ q, limit: "50" });
+    if (kind) params.set("kind", kind);
+    const data = await api("/api/projects/" + encodeURIComponent(project) + "/search?" + params);
+    const rows = data.symbols || [];
+    if (rows.length === 0) {
+      $("results").innerHTML = "<p>No matches.</p>";
+    } else {
+      let html = '<table><thead><tr><th></th><th>Name</th><th>Location</th><th>Signature</th></tr></thead><tbody>';
+      for (const s of rows) {
+        html += '<tr data-id="' + s.id + '"><td><span class="kind">' + esc(s.kind) + "</span></td>" +
+          "<td><code>" + esc(s.name) + "</code>" + (s.is_exported ? " ✓" : "") + "</td>" +
+          "<td class=\"mono\">" + esc(s.path) + ":" + s.start_line + "</td>" +
+          "<td><code>" + esc(s.signature) + "</code></td></tr>";
+      }
+      $("results").innerHTML = html + "</tbody></table>";
+      for (const tr of document.querySelectorAll("#results tr[data-id]")) {
+        tr.addEventListener("click", () => showDetail(project, tr.getAttribute("data-id")));
+      }
+    }
+    setStatus(rows.length + " match(es).", "ok");
+  } catch (e) {
+    setStatus("Search failed: " + e.message, "err");
+  }
+}
+
+async function showDetail(project, id) {
+  setStatus("Loading symbol…");
+  try {
+    const det = await api("/api/projects/" + encodeURIComponent(project) + "/symbols/" + encodeURIComponent(id));
+    const s = det.symbol;
+    let html = "<p class=\"sig\">#" + s.id + " <strong>" + esc(s.name) + '</strong> <span class="kind">' + esc(s.kind) + "</span></p>" +
+      "<p class=\"mono\">" + esc(s.path) + ":" + s.start_line + "-" + s.end_line + "</p>" +
+      "<p class=\"sig\">" + esc(s.signature) + "</p>";
+    if (s.docstring) html += '<p class="doc">' + esc(s.docstring) + "</p>";
+    if (det.code) html += "<pre class=\"code\">" + esc(det.code) + "</pre>";
+    html += '<div class="row"><button class="primary" id="blastBtn">Show blast radius</button></div><div id="blast"></div>';
+    $("detail").innerHTML = html;
+    $("detailWrap").classList.remove("hidden");
+    setStatus("Symbol loaded.", "ok");
+    const blastBtn = $("blastBtn");
+    if (blastBtn) blastBtn.addEventListener("click", async () => {
+      try {
+        const b = await api("/api/projects/" + encodeURIComponent(project) + "/blast?name=" + encodeURIComponent(s.name) + "&limit=50");
+        $("blast").innerHTML =
+          '<div class="cols"><div><h3>Outgoing (' + b.outgoing.length + ")</h3>" + refList(b.outgoing) + "</div>" +
+          "<div><h3>Incoming (" + b.incoming.length + (b.incomingTruncated ? "+" : "") + ")</h3>" + refList(b.incoming) + "</div></div>";
+      } catch (e2) {
+        setStatus("Blast radius failed: " + e2.message, "err");
+      }
+    });
+  } catch (e) {
+    setStatus("Details failed: " + e.message, "err");
+  }
+}
+
+function refList(rels) {
+  if (rels.length === 0) return "<p>None recorded.</p>";
+  let html = "<ul class=\"refs\">";
+  for (const r of rels) {
+    html += "<li><code>" + esc(r.caller_name) + "</code> —" + esc(r.relationship_type) + "→ <code>" +
+      esc(r.callee_name) + "</code> <span class=\"mono\">" + esc(r.caller_path) + ":" + esc(r.caller_line) + "</span></li>";
+  }
+  return html + "</ul>";
+}
+
+$("connect").addEventListener("click", connect);
+$("project").addEventListener("change", () => { renderStats(); $("results").innerHTML = ""; $("detailWrap").classList.add("hidden"); });
+$("search").addEventListener("click", search);
+$("q").addEventListener("keydown", (e) => { if (e.key === "Enter") search(); });
+if (state.token) connect();
+</script>
+</body>
+</html>

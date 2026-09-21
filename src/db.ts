@@ -161,7 +161,19 @@ export class ArgusDb {
   }
 
   countSymbols(): number {
-    const row = this.db.prepare('SELECT COUNT(*) AS n FROM symbols').get();
+    return this.count('SELECT COUNT(*) AS n FROM symbols');
+  }
+
+  countFiles(): number {
+    return this.count('SELECT COUNT(*) AS n FROM files');
+  }
+
+  countRelationships(): number {
+    return this.count('SELECT COUNT(*) AS n FROM symbol_relationships');
+  }
+
+  private count(sql: string): number {
+    const row = this.db.prepare(sql).get();
     if (!isRecord(row)) throw new Error('DB row: expected record');
     return reqNumber(row, 'n');
   }

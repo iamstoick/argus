@@ -2,7 +2,7 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { SYMBOL_KINDS, clampLimit, truncateOutput } from './config.js';
-import { ArgusDb, type SymbolRow } from './db.js';
+import { ArgusDb, type RelationRow, type SymbolRow } from './db.js';
 import { simpleName } from './parser.js';
 
 export interface LookupArgs {
@@ -67,19 +67,28 @@ export function getSymbolDetails(db: ArgusDb, root: string, args: DetailsArgs): 
   if (typeof resolved === 'string') return resolved;
   const row = resolved;
   if (row.path === undefined) return `Symbol #${row.id} has no file path.`;
+  const block = symbolCodeBlock(root, row);
+  if (block === undefined) {
+    return `Symbol #${row.id} (${row.name}) points at ${row.path}, which is no longer readable. Re-sync the index.`;
+  }
+  return truncateOutput(
+    `#${row.id} ${row.name} [${row.kind}] ${row.path}:${row.start_line}-${row.end_line}\n\`\`\`\n${block}\n\`\`\``,
+  );
+}
+
+/** Exact source lines for a symbol row, or undefined when the file is unreadable. */
+export function symbolCodeBlock(root: string, row: SymbolRow): string | undefined {
+  if (row.path === undefined) return undefined;
   let source: string;
   try {
     source = readFileSync(join(root, row.path), 'utf8');
   } catch {
-    return `Symbol #${row.id} (${row.name}) points at ${row.path}, which is no longer readable. Re-sync the index.`;
+    return undefined;
   }
   const lines = source.split('\n');
   const start = Math.max(0, row.start_line - 1);
   const end = Math.min(lines.length, row.end_line);
-  const block = lines.slice(start, end).join('\n');
-  return truncateOutput(
-    `#${row.id} ${row.name} [${row.kind}] ${row.path}:${row.start_line}-${row.end_line}\n\`\`\`\n${block}\n\`\`\``,
-  );
+  return lines.slice(start, end).join('\n');
 }
 
 export interface BlastArgs {
@@ -87,48 +96,60 @@ export interface BlastArgs {
   limit?: number | undefined;
 }
 
-export function checkBlastRadius(db: ArgusDb, args: BlastArgs): string {
-  const name = args.symbol_name.trim();
-  if (name === '') return 'Empty symbol_name: pass the symbol to trace.';
-  const limit = clampLimit(args.limit);
+export interface BlastData {
+  matched: SymbolRow[];
+  outgoing: RelationRow[];
+  incoming: RelationRow[];
+  incomingTruncated: boolean;
+}
+
+/** Structured blast radius shared by the MCP tool and the admin JSON API. */
+export function blastRadiusData(db: ArgusDb, rawName: string, rawLimit: number | undefined): BlastData | { error: string } {
+  const name = rawName.trim();
+  if (name === '') return { error: 'Empty symbol_name: pass the symbol to trace.' };
+  const limit = clampLimit(rawLimit);
   const targets = db.symbolsByNameExact(name);
-  const resolved = targets.length > 0 ? targets : db.symbolsByNameLike(name, 5);
-  if (resolved.length === 0) return `No symbol matching '${name}'.`;
-  const ids = resolved.map((r) => r.id);
-  const simpleTargets = new Set(resolved.map((r) => simpleName(r.name)));
-
-  const out: string[] = [];
-  out.push(`Blast radius for '${name}' (${resolved.length} matched symbol(s)):`);
-  for (const r of resolved.slice(0, 5)) {
-    out.push(`  #${r.id} ${r.name} [${r.kind}] ${r.path}:${r.start_line}`);
-  }
-
+  const matched = targets.length > 0 ? targets : db.symbolsByNameLike(name, 5);
+  if (matched.length === 0) return { error: `No symbol matching '${name}'.` };
+  const ids = matched.map((r) => r.id);
   const outgoing = db.outgoing(ids).slice(0, limit);
-  out.push('', `Outgoing dependencies (${outgoing.length}):`);
-  if (outgoing.length === 0) out.push('  (none recorded)');
-  for (const rel of outgoing) {
-    out.push(
-      `  ${rel.caller_name} --${rel.relationship_type}--> ${rel.callee_name} (${rel.caller_path}:${rel.caller_line})`,
-    );
-  }
-
   const incomingSeen = new Set<string>();
-  const incomingLines: string[] = [];
-  for (const simple of simpleTargets) {
+  const incoming: RelationRow[] = [];
+  for (const simple of new Set(matched.map((r) => simpleName(r.name)))) {
     for (const rel of db.incoming(simple, limit)) {
       const key = `${rel.caller_id}:${rel.relationship_type}`;
       if (incomingSeen.has(key)) continue;
       incomingSeen.add(key);
-      incomingLines.push(
-        `  ${rel.caller_name} --${rel.relationship_type}--> ${rel.callee_name} (${rel.caller_path}:${rel.caller_line})`,
-      );
-      if (incomingLines.length >= limit) break;
+      incoming.push(rel);
+      if (incoming.length >= limit) break;
     }
-    if (incomingLines.length >= limit) break;
+    if (incoming.length >= limit) break;
   }
-  out.push('', `Incoming dependents (${incomingLines.length}${incomingLines.length >= limit ? '+' : ''}):`);
-  if (incomingLines.length === 0) out.push('  (none recorded)');
-  out.push(...incomingLines);
+  return { matched, outgoing, incoming, incomingTruncated: incoming.length >= limit };
+}
+
+export function checkBlastRadius(db: ArgusDb, args: BlastArgs): string {
+  const data = blastRadiusData(db, args.symbol_name, args.limit);
+  if ('error' in data) return data.error;
+  const out: string[] = [];
+  out.push(`Blast radius for '${args.symbol_name.trim()}' (${data.matched.length} matched symbol(s)):`);
+  for (const r of data.matched.slice(0, 5)) {
+    out.push(`  #${r.id} ${r.name} [${r.kind}] ${r.path}:${r.start_line}`);
+  }
+  out.push('', `Outgoing dependencies (${data.outgoing.length}):`);
+  if (data.outgoing.length === 0) out.push('  (none recorded)');
+  for (const rel of data.outgoing) {
+    out.push(
+      `  ${rel.caller_name} --${rel.relationship_type}--> ${rel.callee_name} (${rel.caller_path}:${rel.caller_line})`,
+    );
+  }
+  out.push('', `Incoming dependents (${data.incoming.length}${data.incomingTruncated ? '+' : ''}):`);
+  if (data.incoming.length === 0) out.push('  (none recorded)');
+  for (const rel of data.incoming) {
+    out.push(
+      `  ${rel.caller_name} --${rel.relationship_type}--> ${rel.callee_name} (${rel.caller_path}:${rel.caller_line})`,
+    );
+  }
   return truncateOutput(out.join('\n'));
 }
 
