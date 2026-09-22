@@ -45,7 +45,14 @@ describe('IndexManager', () => {
       assert.equal(stats?.files, 1);
       assert.equal(stats?.symbols, 1);
       assert.equal(stats?.watching, false);
+      assert.deepEqual(stats?.byExtension, { ts: 1 });
+      assert.deepEqual(stats?.byKind, { function: 1 });
+      assert.match(stats?.lastSyncAt ?? '', /^\d{4}-\d{2}-\d{2} /);
       assert.equal(manager.allStats().length, 2);
+      const health = manager.health();
+      assert.deepEqual(health.projects, ['pa', 'pb']);
+      assert.match(health.startedAt, /^\d{4}-\d{2}-\d{2}T/);
+      assert.ok(health.grammars.loaded.includes('typescript'));
     } finally {
       await manager.close();
       rmSync(a, { recursive: true, force: true });

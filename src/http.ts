@@ -156,6 +156,10 @@ export function createRequestHandler(
       sendJson(res, 200, { projects: manager.allStats() });
       return;
     }
+    if (url.pathname === '/api/health') {
+      sendJson(res, 200, { version: opts.version, ...manager.health() });
+      return;
+    }
     const match = /^\/api\/projects\/([^/]+)\/(search|symbols|blast)(?:\/([^/]+))?$/.exec(url.pathname);
     const seg1 = match?.[1];
     const seg2 = match?.[2];

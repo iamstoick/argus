@@ -178,6 +178,23 @@ export class ArgusDb {
     return reqNumber(row, 'n');
   }
 
+  /** UTC "YYYY-MM-DD HH:MM:SS" of the newest parse, or null when empty. */
+  lastParsedAt(): string | null {
+    const row = this.db.prepare('SELECT MAX(parsed_at) AS m FROM files').get();
+    if (!isRecord(row)) throw new Error('DB row: expected record');
+    const value = row['m'];
+    return typeof value === 'string' ? value : null;
+  }
+
+  countByKind(): Record<string, number> {
+    const out: Record<string, number> = {};
+    for (const row of this.db.prepare('SELECT kind, COUNT(*) AS n FROM symbols GROUP BY kind').all()) {
+      if (!isRecord(row)) throw new Error('DB row: expected record');
+      out[reqString(row, 'kind')] = reqNumber(row, 'n');
+    }
+    return out;
+  }
+
   /**
    * Atomically replace one file's symbols + relationships.
    * Callers outside a file replace must not interleave; single-writer process.

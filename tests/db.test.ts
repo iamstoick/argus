@@ -114,6 +114,19 @@ describe('ArgusDb', () => {
     }
   });
 
+  it('reports last parse time and kind counts', () => {
+    const db = new ArgusDb(':memory:');
+    try {
+      assert.equal(db.lastParsedAt(), null);
+      assert.deepEqual(db.countByKind(), {});
+      seed(db);
+      assert.match(db.lastParsedAt() ?? '', /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/);
+      assert.deepEqual(db.countByKind(), { function: 2, method: 1 });
+    } finally {
+      db.close();
+    }
+  });
+
   it('lists exported symbols by module prefix', () => {
     const db = new ArgusDb(':memory:');
     try {

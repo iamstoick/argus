@@ -23,6 +23,23 @@ export interface ProjectStats {
   relationships: number;
   watching: boolean;
   lastSync: IndexStats | undefined;
+  /** UTC "YYYY-MM-DD HH:MM:SS" of the newest file parse, or null. */
+  lastSyncAt: string | null;
+  /** File counts by lowercase extension without dot, e.g. { tsx: 42 }. */
+  byExtension: Record<string, number>;
+  /** Symbol counts by kind, e.g. { function: 100, class: 5 }. */
+  byKind: Record<string, number>;
+}
+
+export interface EngineHealth {
+  loaded: string[];
+  unavailable: Record<string, string>;
+}
+
+export interface ServerHealth {
+  startedAt: string;
+  projects: string[];
+  grammars: EngineHealth;
 }
 
 export type ProjectResolution =
@@ -36,6 +53,8 @@ export type ProjectResolution =
 export class IndexManager {
   private readonly projects = new Map<string, ProjectEntry>();
   private readonly watchers: FSWatcher[] = [];
+  private readonly startedAt: string = new Date().toISOString();
+  private engineHealth: EngineHealth = { loaded: [], unavailable: {} };
 
   private constructor(entries: ProjectEntry[]) {
     for (const e of entries) this.projects.set(e.name, e);
@@ -47,6 +66,10 @@ export class IndexManager {
     opts: { watch: boolean; onError: (msg: string) => void },
   ): Promise<IndexManager> {
     const manager = new IndexManager([]);
+    manager.engineHealth = {
+      loaded: engine.supportedLanguages(),
+      unavailable: Object.fromEntries(engine.unavailableLanguages()),
+    };
     try {
       for (const spec of specs) {
         manager.openOne(spec, engine, opts);
@@ -123,6 +146,12 @@ export class IndexManager {
   stats(name: string): ProjectStats | undefined {
     const entry = this.projects.get(name);
     if (entry === undefined) return undefined;
+    const byExtension: Record<string, number> = {};
+    for (const file of entry.db.listFiles()) {
+      const dot = file.path.lastIndexOf('.');
+      const ext = dot >= 0 ? file.path.slice(dot + 1).toLowerCase() : '?';
+      byExtension[ext] = (byExtension[ext] ?? 0) + 1;
+    }
     return {
       name: entry.name,
       root: entry.root,
@@ -131,7 +160,14 @@ export class IndexManager {
       relationships: entry.db.countRelationships(),
       watching: entry.watching,
       lastSync: entry.lastSync,
+      lastSyncAt: entry.db.lastParsedAt(),
+      byExtension,
+      byKind: entry.db.countByKind(),
     };
+  }
+
+  health(): ServerHealth {
+    return { startedAt: this.startedAt, projects: this.names(), grammars: this.engineHealth };
   }
 
   allStats(): ProjectStats[] {

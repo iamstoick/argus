@@ -143,11 +143,31 @@ describe('http handler', () => {
         return res;
       };
       const projects = (await get('/api/projects')).json() as {
-        projects: Array<{ name: string; symbols: number }>;
+        projects: Array<{
+          name: string;
+          symbols: number;
+          lastSyncAt: string | null;
+          byExtension: Record<string, number>;
+          byKind: Record<string, number>;
+        }>;
       };
       assert.equal(projects.projects.length, 1);
       assert.equal(projects.projects[0]?.name, 'demo');
       assert.equal(projects.projects[0]?.symbols, 2);
+      assert.deepEqual(projects.projects[0]?.byExtension, { ts: 1 });
+      assert.deepEqual(projects.projects[0]?.byKind, { function: 2 });
+      assert.match(projects.projects[0]?.lastSyncAt ?? '', /^\d{4}-\d{2}-\d{2} /);
+
+      const health = (await get('/api/health')).json() as {
+        version: string;
+        startedAt: string;
+        projects: string[];
+        grammars: { loaded: string[]; unavailable: Record<string, string> };
+      };
+      assert.equal(health.version, 'test');
+      assert.match(health.startedAt, /^\d{4}-\d{2}-\d{2}T/);
+      assert.deepEqual(health.projects, ['demo']);
+      assert.ok(health.grammars.loaded.includes('typescript'));
 
       const search = (await get('/api/projects/demo/search?q=add')).json() as {
         symbols: Array<{ id: number; name: string }>;
