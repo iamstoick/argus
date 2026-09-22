@@ -9,7 +9,7 @@ import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 import { SYMBOL_KINDS, clampLimit, isValidProjectName } from './config.js';
 import type { IndexManager } from './projects.js';
 import { createMcpServer } from './server.js';
-import { blastRadiusData, symbolCodeBlock } from './tools.js';
+import { blastRadiusData, deadCodeData, duplicateGroupsData, symbolCodeBlock } from './tools.js';
 
 export interface HttpOptions {
   host: string;
@@ -160,7 +160,9 @@ export function createRequestHandler(
       sendJson(res, 200, { version: opts.version, ...manager.health() });
       return;
     }
-    const match = /^\/api\/projects\/([^/]+)\/(search|symbols|blast)(?:\/([^/]+))?$/.exec(url.pathname);
+    const match = /^\/api\/projects\/([^/]+)\/(search|symbols|blast|duplicates|dead-code)(?:\/([^/]+))?$/.exec(
+      url.pathname,
+    );
     const seg1 = match?.[1];
     const seg2 = match?.[2];
     const seg3 = match?.[3];
@@ -207,6 +209,17 @@ export function createRequestHandler(
         return;
       }
       sendJson(res, 200, { symbol: row, code: symbolCodeBlock(entry.root, row) ?? null });
+      return;
+    }
+    if (action === 'duplicates') {
+      const limit = clampLimit(Number(url.searchParams.get('limit') ?? Number.NaN));
+      sendJson(res, 200, duplicateGroupsData(entry.db, limit));
+      return;
+    }
+    if (action === 'dead-code') {
+      const limit = clampLimit(Number(url.searchParams.get('limit') ?? Number.NaN));
+      const includeExported = url.searchParams.get('include_exported') === 'true';
+      sendJson(res, 200, deadCodeData(entry.db, includeExported, limit));
       return;
     }
     // action === 'blast'

@@ -3,7 +3,14 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 import type { IndexManager, ProjectEntry } from './projects.js';
-import { checkBlastRadius, getCodebaseMap, getSymbolDetails, lookupDictionary } from './tools.js';
+import {
+  checkBlastRadius,
+  findDeadCode,
+  findDuplicates,
+  getCodebaseMap,
+  getSymbolDetails,
+  lookupDictionary,
+} from './tools.js';
 
 type TextResult = { content: Array<{ type: 'text'; text: string }> };
 
@@ -99,6 +106,37 @@ export function createMcpServer(manager: IndexManager, version: string): McpServ
     (args) =>
       Promise.resolve(
         withProject(manager, 'check_blast_radius', args.project, (entry) => checkBlastRadius(entry.db, args)),
+      ),
+  );
+
+  server.registerTool(
+    'find_duplicates',
+    {
+      description: 'Proactive copy-paste report: symbols sharing a normalized name and signature across the project.',
+      inputSchema: {
+        limit: z.number().optional().describe('Max groups (default 50)'),
+        project: projectField,
+      },
+    },
+    (args) =>
+      Promise.resolve(
+        withProject(manager, 'find_duplicates', args.project, (entry) => findDuplicates(entry.db, args)),
+      ),
+  );
+
+  server.registerTool(
+    'find_dead_code',
+    {
+      description: 'Symbols nothing calls. Conservative by construction; review framework entry points before deleting.',
+      inputSchema: {
+        include_exported: z.boolean().optional().describe('Also scan exported symbols (default false)'),
+        limit: z.number().optional().describe('Max symbols (default 50)'),
+        project: projectField,
+      },
+    },
+    (args) =>
+      Promise.resolve(
+        withProject(manager, 'find_dead_code', args.project, (entry) => findDeadCode(entry.db, args)),
       ),
   );
 

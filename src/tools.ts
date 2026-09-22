@@ -187,6 +187,141 @@ function candidateLine(r: SymbolRow): string {
   return `  #${r.id} ${r.name} [${r.kind}] ${r.path}:${r.start_line}`;
 }
 
+export interface DuplicateGroup {
+  /** Normalized name the members share. */
+  key: string;
+  symbols: SymbolRow[];
+}
+
+export interface DuplicatesData {
+  groups: DuplicateGroup[];
+  truncated: boolean;
+}
+
+/** Kinds eligible for duplicate detection; methods are excluded (same name across classes is polymorphism, not copying). */
+const DUPLICATE_KINDS: ReadonlySet<string> = new Set([
+  'function',
+  'class',
+  'interface',
+  'struct',
+  'enum',
+  'trait',
+  'type',
+  'module',
+]);
+
+function normalizeName(simple: string): string {
+  return simple.toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+function normalizeSignature(signature: string): string {
+  return signature.toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+/** Copy-paste candidates: same normalized name AND signature, distinct declarations. */
+export function duplicateGroupsData(db: ArgusDb, rawLimit: number | undefined): DuplicatesData {
+  const limit = clampLimit(rawLimit);
+  const buckets = new Map<string, SymbolRow[]>();
+  for (const row of db.allSymbols()) {
+    if (!DUPLICATE_KINDS.has(row.kind)) continue;
+    const key = `${normalizeName(simpleName(row.name))}||${normalizeSignature(row.signature)}`;
+    const bucket = buckets.get(key);
+    if (bucket === undefined) buckets.set(key, [row]);
+    else bucket.push(row);
+  }
+  const groups: DuplicateGroup[] = [];
+  for (const members of buckets.values()) {
+    if (members.length < 2) continue;
+    const first = members[0];
+    if (first === undefined) continue;
+    groups.push({ key: normalizeName(simpleName(first.name)), symbols: members });
+  }
+  groups.sort((a, b) => b.symbols.length - a.symbols.length || (a.key < b.key ? -1 : 1));
+  return { groups: groups.slice(0, limit), truncated: groups.length > limit };
+}
+
+export interface DuplicatesArgs {
+  limit?: number | undefined;
+}
+
+export function findDuplicates(db: ArgusDb, args: DuplicatesArgs): string {
+  const data = duplicateGroupsData(db, args.limit);
+  if (data.groups.length === 0) return 'No likely duplicates found.';
+  const lines: string[] = [`Found ${data.groups.length} duplicate group(s):`];
+  for (const g of data.groups) {
+    lines.push(`'${g.key}' (${g.symbols.length} copies):`);
+    for (const s of g.symbols) {
+      lines.push(`  #${s.id} ${s.name} [${s.kind}] ${s.path}:${s.start_line}`);
+    }
+  }
+  if (data.truncated) lines.push('…more groups exist; raise the limit.');
+  return truncateOutput(lines.join('\n'));
+}
+
+export interface DeadCodeData {
+  symbols: SymbolRow[];
+  truncated: boolean;
+}
+
+/** Implicitly-invoked names that never appear as call targets (conservative: never reported dead). */
+const ENTRY_NAMES: ReadonlySet<string> = new Set(['main', 'constructor', '__construct', '__init__', 'initialize']);
+
+function isEntryish(simple: string): boolean {
+  if (ENTRY_NAMES.has(simple)) return true;
+  return /^__[a-zA-Z0-9_]+__$/.test(simple);
+}
+
+/**
+ * Symbols nothing calls. Conservative by construction: callee matching uses
+ * simple names, so any same-named call keeps a symbol alive. Framework entry
+ * points wired by decorator (route handlers) can still appear dead — review
+ * before deleting.
+ */
+export function deadCodeData(
+  db: ArgusDb,
+  rawIncludeExported: boolean | undefined,
+  rawLimit: number | undefined,
+): DeadCodeData {
+  const limit = clampLimit(rawLimit);
+  const includeExported = rawIncludeExported === true;
+  const callees = db.allCalleeNames();
+  const dead = db
+    .allSymbols()
+    .filter((s) => {
+      if (!includeExported && s.is_exported === 1) return false;
+      const simple = simpleName(s.name);
+      if (isEntryish(simple)) return false;
+      return !callees.has(simple);
+    })
+    .sort((a, b) => {
+      const pa = a.path ?? '';
+      const pb = b.path ?? '';
+      return pa < pb ? -1 : pa > pb ? 1 : a.start_line - b.start_line;
+    });
+  return { symbols: dead.slice(0, limit), truncated: dead.length > limit };
+}
+
+export interface DeadCodeArgs {
+  include_exported?: boolean | undefined;
+  limit?: number | undefined;
+}
+
+export function findDeadCode(db: ArgusDb, args: DeadCodeArgs): string {
+  const data = deadCodeData(db, args.include_exported, args.limit);
+  if (data.symbols.length === 0) {
+    return args.include_exported === true
+      ? 'No dead code found (including exported symbols).'
+      : 'No dead code found among unexported symbols. Pass include_exported to also scan the public surface.';
+  }
+  const lines: string[] = [
+    `Found ${data.symbols.length} possibly-dead symbol(s)${data.truncated ? ' (truncated)' : ''}:`,
+    ...data.symbols.map((s) => `- #${s.id} ${s.name} [${s.kind}]${s.is_exported === 1 ? ' ✓exported' : ''} ${s.path}:${s.start_line}`),
+    'Review before deleting: framework entry points (e.g. route handlers) can appear dead.',
+  ];
+  if (data.truncated) lines.push('…more exist; raise the limit.');
+  return truncateOutput(lines.join('\n'));
+}
+
 function formatSymbolLine(r: SymbolRow): string {
   const doc = r.docstring !== null && r.docstring !== '' ? ` — ${r.docstring}` : '';
   const exp = r.is_exported === 1 ? ' ✓exported' : '';

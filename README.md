@@ -146,6 +146,8 @@ Add this to the indexed project's `AGENTS.md` / `.cursorrules` so agents actuall
 | `get_codebase_map` | `module_path` (optional prefix), `limit` (optional) | Exported symbols + signatures per file |
 | `get_symbol_details` | `symbol_id` or `symbol_name` | Exact source block for one symbol |
 | `check_blast_radius` | `symbol_name`, `limit` (optional) | Incoming dependents + outgoing dependencies |
+| `find_duplicates` | `limit` (optional) | Symbols sharing normalized name + signature |
+| `find_dead_code` | `include_exported` (optional), `limit` (optional) | Symbols nothing calls (conservative) |
 
 Outputs are token-budgeted (50 results / ~12k chars by default, with truncation notices).
 
@@ -184,7 +186,7 @@ src/
   http.ts     HTTP: MCP Streamable, JSON API, admin page, token auth
   admin/      Admin web UI (single static page, observe-only)
   projects.ts Multi-project index manager (isolated DB + watcher per project)
-  tools.ts    The 4 tool handlers
+  tools.ts    The 6 tool handlers + analysis (duplicates, dead code)
   indexer.ts  SHA-256 delta sync + chokidar watcher
   parser.ts   Tree-sitter engine: symbols, signatures, docstrings, refs
   queries.ts  S-expression query packs per language

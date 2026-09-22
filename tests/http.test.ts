@@ -199,6 +199,22 @@ describe('http handler', () => {
       assert.ok(blast.incoming.some((r) => r.caller_name === 'total'));
       assert.equal((await get('/api/projects/demo/blast?name=zzz')).statusCode, 404);
       assert.equal((await get('/api/projects/demo/blast')).statusCode, 400);
+
+      const dups = (await get('/api/projects/demo/duplicates')).json() as {
+        groups: unknown[];
+        truncated: boolean;
+      };
+      assert.deepEqual(dups.groups, []);
+      assert.equal(dups.truncated, false);
+      const dead = (await get('/api/projects/demo/dead-code')).json() as {
+        symbols: Array<{ name: string }>;
+      };
+      assert.deepEqual(dead.symbols, []);
+      const deadPublic = (await get('/api/projects/demo/dead-code?include_exported=true')).json() as {
+        symbols: Array<{ name: string }>;
+      };
+      assert.deepEqual(deadPublic.symbols.map((s) => s.name), ['total']);
+      assert.equal((await get('/api/projects/nope/duplicates')).statusCode, 404);
     } finally {
       await teardownManager(t);
     }

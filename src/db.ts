@@ -195,6 +195,24 @@ export class ArgusDb {
     return out;
   }
 
+  /** Every symbol with its file path, for whole-index analyses. */
+  allSymbols(): SymbolRow[] {
+    return this.db
+      .prepare('SELECT s.*, f.path FROM symbols s JOIN files f ON f.id = s.file_id ORDER BY s.name')
+      .all()
+      .map(toSymbolRow);
+  }
+
+  /** Every distinct recorded callee name (liveness set for dead-code analysis). */
+  allCalleeNames(): Set<string> {
+    const out = new Set<string>();
+    for (const row of this.db.prepare('SELECT DISTINCT callee_name AS n FROM symbol_relationships').all()) {
+      if (!isRecord(row)) throw new Error('DB row: expected record');
+      out.add(reqString(row, 'n'));
+    }
+    return out;
+  }
+
   /**
    * Atomically replace one file's symbols + relationships.
    * Callers outside a file replace must not interleave; single-writer process.
