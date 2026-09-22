@@ -44,10 +44,19 @@ class MockRes extends EventEmitter {
   headersSent = false;
   body = '';
   contentType = '';
+  headers: Record<string, string> = {};
 
-  writeHead(status: number, headers: Record<string, string>): this {
+  setHeader(name: string, value: string): this {
+    this.headers[name.toLowerCase()] = value;
+    return this;
+  }
+
+  writeHead(status: number, headers?: Record<string, string>): this {
     this.statusCode = status;
-    this.contentType = headers['content-type'] ?? '';
+    if (headers !== undefined) {
+      this.contentType = headers['content-type'] ?? this.contentType;
+      for (const [k, v] of Object.entries(headers)) this.headers[k.toLowerCase()] = v;
+    }
     this.headersSent = true;
     return this;
   }
@@ -170,6 +179,28 @@ describe('http handler', () => {
       assert.ok(blast.incoming.some((r) => r.caller_name === 'total'));
       assert.equal((await get('/api/projects/demo/blast?name=zzz')).statusCode, 404);
       assert.equal((await get('/api/projects/demo/blast')).statusCode, 400);
+    } finally {
+      await teardownManager(t);
+    }
+  });
+
+  it('answers CORS preflights and tags responses for sharing', async () => {
+    const t = await setupManager();
+    try {
+      const handler = createRequestHandler(t.manager, { host: '127.0.0.1', port: 0, token: TOKEN, version: 'test' });
+      const preflight = new MockRes();
+      await handler(asReq(new MockReq('OPTIONS', '/api/projects')), asRes(preflight));
+      assert.equal(preflight.statusCode, 204);
+      assert.equal(preflight.headers['access-control-allow-origin'], '*');
+      const denied = new MockRes();
+      await handler(asReq(new MockReq('GET', '/api/projects')), asRes(denied));
+      assert.equal(denied.statusCode, 401);
+      assert.equal(denied.headers['access-control-allow-origin'], '*');
+      const { req, res } = authed('/api/projects');
+      await handler(asReq(req), asRes(res));
+      assert.equal(res.statusCode, 200);
+      assert.equal(res.headers['access-control-allow-origin'], '*');
+      assert.match(res.headers['access-control-allow-headers'] ?? '', /authorization/);
     } finally {
       await teardownManager(t);
     }

@@ -123,6 +123,16 @@ export function createRequestHandler(
   let adminHtml: string | undefined;
 
   async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    // CORS for browser dashboards (e.g. Astra): preflights carry no auth, so
+    // answer OPTIONS before the auth gate and tag every response for sharing.
+    res.setHeader('access-control-allow-origin', '*');
+    res.setHeader('access-control-allow-headers', 'authorization, content-type, mcp-session-id');
+    res.setHeader('access-control-allow-methods', 'GET, POST, DELETE, OPTIONS');
+    if (req.method === 'OPTIONS') {
+      res.writeHead(204);
+      res.end();
+      return;
+    }
     if (!authorized(req, opts.token)) {
       sendJson(res, 401, { error: 'missing or invalid bearer token' });
       return;
