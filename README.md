@@ -1,22 +1,67 @@
-# Argus — Codebase Dictionary & Evolution MCP Server
+```
++--------------------------------------------+
+|    _    ____   ____ _   _ ____             |
+|   / \  |  _ \ / ___| | | / ___|            |
+|  / _ \ | |_) | |  _| | | \___ \            |
+| / ___ \|  _ <| |_| | |_| |___) |           |
+| /_/   \_\_| \_\\____|\___/|____/           |
+|                                            |
+| Codebase Dictionary & Evolution MCP Server |
++--------------------------------------------+
+```
+
+<p align="center">
+  <strong>Shared structural memory for AI coding agents.</strong><br>
+  Agents query the index instead of scanning raw files — no more duplicated
+  code, wasted tokens, or blind refactors.
+</p>
+
+<p align="center">
+  <a href="https://buymeacoffee.com/stoickthevast"><img src="https://img.shields.io/badge/Buy%20Me%20a%20Coffee-support-yellow?style=flat&logo=buy-me-a-coffee" alt="Buy Me A Coffee"></a>
+  <img src="https://img.shields.io/badge/node-%3E%3D22.12-brightgreen" alt="Node >= 22.12">
+  <img src="https://img.shields.io/badge/MCP-stdio%20%2B%20HTTP-blue" alt="MCP stdio + HTTP">
+</p>
 
 Argus indexes the **structure** of a polyglot codebase (symbols, signatures, docstrings, call
 relationships) into a local SQLite database and serves it to AI coding assistants over the
-[Model Context Protocol](https://modelcontextprotocol.io). Agents query the index instead of
-scanning raw files, which prevents code duplication and cuts context-token consumption.
+[Model Context Protocol](https://modelcontextprotocol.io).
+
+## Architecture
 
 ```
-[ Workspace Files ]
-          │  (chokidar watcher / SHA-256 hash delta)
-          ▼
-[ Incremental Tree-sitter Parser ]
-          │  (signatures + call graph, bodies stripped)
-          ▼
-[ Local SQLite Database (.mcp-codebase.db) ]
-          │  (MCP stdio interface)
-          ▼
-[ AI Agent ]
+  +---------------------+   +---------------------+   +---------------------+
+  |   Local AI agents   |   |    Remote agents    |   |        Astra        |
+  |  Claude / Cursor /  |   |  (team, over HTTP)  |   |   fleet dashboard   |
+  |  Codex via stdio    |   |                     |   |   (Docker :5555)    |
+  +---------------------+   +---------------------+   +---------------------+
+             | MCP stdio               | /mcp (Streamable HTTP)  | /api (JSON)
+             v                         v                         v
+  +---------------------+   +-----------------------------------------------+
+  |  argus --root ...   |   |       argus serve [--config ...]              |
+  |  single project,    |   |  token auth + loopback-or-token bind guard    |
+  |  local index        |   |  / = admin UI (health, search, blast radius)  |
+  +----------|----------+   +-----------------------|-----------------------+
+             +-----------------+-----------------+--+
+             v                 v                 v
+      +-------------+   +-------------+   +-------------+
+      | Project:web |   | Project:api |   | Project:... |
+      | .mcp-       |   | .mcp-       |   | .mcp-       |
+      | codebase.db |   | codebase.db |   | codebase.db |
+      +-------------+   +-------------+   +-------------+
+             ^                 ^                 ^
+             |                 |                 |
+             +-----------------+-----------------+
+                               |
+            hash-delta sync + chokidar watcher (per project, isolated)
+            tree-sitter parse: symbols, signatures, docstrings, refs
+                               v
+        +----------------------------------------------+
+        |  Workspace files (TS TSX JS PY GO RS PHP RB) |
+        +----------------------------------------------+
 ```
+
+Each project keeps its own isolated `.mcp-codebase.db` index; nothing is shared
+between projects. Parse failures and watcher errors are logged, never fatal.
 
 ## Requirements
 
@@ -195,3 +240,16 @@ src/
 tests/        node:test suite (53 tests: parser fixtures, db, indexer, tools,
               projects, config, http handler + live socket, watcher)
 ```
+
+## Support
+
+Argus is built and maintained in the open. If it saves your agents some tokens
+(or saves you from a blind refactor), consider fuelling the next feature:
+
+<p align="center">
+  <a href="https://buymeacoffee.com/stoickthevast"><img src="https://img.shields.io/badge/Buy%20Me%20a%20Coffee-support-yellow?style=for-the-badge&logo=buy-me-a-coffee" alt="Buy Me A Coffee"></a>
+</p>
+
+<p align="center">
+  <a href="https://buymeacoffee.com/stoickthevast">buymeacoffee.com/stoickthevast</a>
+</p>
