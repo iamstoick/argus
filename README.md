@@ -124,7 +124,7 @@ Build once, then point your MCP client at the absolute entrypoint:
 
 ```bash
 npm run build
-# entrypoint: /Users/gerald/Apps/argus/dist/src/index.js
+# entrypoint: /path/to/argus/dist/src/index.js
 ```
 
 **Claude Code** (`~/.claude.json` or project `.mcp.json`):
@@ -134,13 +134,13 @@ npm run build
   "mcpServers": {
     "argus": {
       "command": "node",
-      "args": ["/Users/gerald/Apps/argus/dist/src/index.js", "--root", "/path/to/project"]
+      "args": ["/path/to/argus/dist/src/index.js", "--root", "/path/to/project"]
     }
   }
 }
 ```
 
-or via CLI: `Muse mcp add argus -- node /Users/gerald/Apps/argus/dist/src/index.js --root /path/to/project`
+or via CLI: `Muse mcp add argus -- node /path/to/argus/dist/src/index.js --root /path/to/project`
 
 **Remote agents against `serve` mode** — Streamable HTTP entry (Muse
 `~/.config/muse/settings.json`, or any MCP client with HTTP support):
@@ -168,7 +168,7 @@ With several projects configured, pass `"project": "<name>"` on every tool call
   "mcpServers": {
     "argus": {
       "command": "node",
-      "args": ["/Users/gerald/Apps/argus/dist/src/index.js", "--root", "/path/to/project"]
+      "args": ["/path/to/argus/dist/src/index.js", "--root", "/path/to/project"]
     }
   }
 }
