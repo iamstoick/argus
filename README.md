@@ -1,5 +1,7 @@
-![Uploading image.png…]()
-#Codebase Dictionary & Evolution MCP Server
+<img width="1376" height="768" alt="argus" src="https://github.com/user-attachments/assets/b453a0b5-a70c-4158-93c6-fbc8db13b79e" />
+
+
+# Argus: Codebase Dictionary & Evolution MCP Server
 
 <p align="center">
   <strong>Shared structural memory for AI coding agents.</strong><br>
