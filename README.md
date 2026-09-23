@@ -1,14 +1,5 @@
-```
-+--------------------------------------------+
-|    _    ____   ____ _   _ ____             |
-|   / \  |  _ \ / ___| | | / ___|            |
-|  / _ \ | |_) | |  _| | | \___ \            |
-| / ___ \|  _ <| |_| | |_| |___) |           |
-| /_/   \_\_| \_\\____|\___/|____/           |
-|                                            |
-| Codebase Dictionary & Evolution MCP Server |
-+--------------------------------------------+
-```
+![Uploading image.png…]()
+#Codebase Dictionary & Evolution MCP Server
 
 <p align="center">
   <strong>Shared structural memory for AI coding agents.</strong><br>
