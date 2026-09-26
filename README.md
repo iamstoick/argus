@@ -21,37 +21,7 @@ relationships) into a local SQLite database and serves it to AI coding assistant
 
 ## Architecture
 
-```
-  +---------------------+   +---------------------+   +---------------------+
-  |   Local AI agents   |   |    Remote agents    |   |        Astra        |
-  |  Claude / Cursor /  |   |  (team, over HTTP)  |   |   fleet dashboard   |
-  |  Codex via stdio    |   |                     |   |   (Docker :5555)    |
-  +---------------------+   +---------------------+   +---------------------+
-             | MCP stdio               | /mcp (Streamable HTTP)  | /api (JSON)
-             v                         v                         v
-  +---------------------+   +-----------------------------------------------+
-  |  argus --root ...   |   |       argus serve [--config ...]              |
-  |  single project,    |   |  token auth + loopback-or-token bind guard    |
-  |  local index        |   |  / = admin UI (health, search, blast radius)  |
-  +----------|----------+   +-----------------------|-----------------------+
-             +-----------------+-----------------+--+
-             v                 v                 v
-      +-------------+   +-------------+   +-------------+
-      | Project:web |   | Project:api |   | Project:... |
-      | .mcp-       |   | .mcp-       |   | .mcp-       |
-      | codebase.db |   | codebase.db |   | codebase.db |
-      +-------------+   +-------------+   +-------------+
-             ^                 ^                 ^
-             |                 |                 |
-             +-----------------+-----------------+
-                               |
-            hash-delta sync + chokidar watcher (per project, isolated)
-            tree-sitter parse: symbols, signatures, docstrings, refs
-                               v
-        +----------------------------------------------+
-        |  Workspace files (TS TSX JS PY GO RS PHP RB) |
-        +----------------------------------------------+
-```
+<img width="1216" height="880" alt="image" src="https://github.com/user-attachments/assets/1b0b2579-7fd1-4847-89e2-cea19ab8d463" />
 
 Each project keeps its own isolated `.mcp-codebase.db` index; nothing is shared
 between projects. Parse failures and watcher errors are logged, never fatal.
