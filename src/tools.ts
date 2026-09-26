@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { SYMBOL_KINDS, clampLimit, truncateOutput } from './config.js';
 import { ArgusDb, type RelationRow, type SymbolRow } from './db.js';
+import { cosineSimilarity, type EmbeddingProvider } from './embeddings.js';
 import { simpleName } from './parser.js';
 
 export interface LookupArgs {
@@ -26,6 +27,96 @@ export function lookupDictionary(db: ArgusDb, args: LookupArgs): string {
   let out = `Found ${rows.length > limit ? `>${limit}` : rows.length} symbol(s) matching '${query}':\n${lines.join('\n')}`;
   if (rows.length > limit) out += `\n…more than ${limit} matches; narrow the query.`;
   return truncateOutput(out);
+}
+
+/**
+ * Hybrid cascade: exact substring matches first, then lexical-similar
+ * (FTS5 tokens + typo tolerance), then semantic-similar when a provider is
+ * configured. Each tier only adds ids the earlier tiers missed.
+ */
+export async function lookupDictionaryHybrid(
+  db: ArgusDb,
+  args: LookupArgs,
+  embeddings?: EmbeddingProvider | undefined,
+): Promise<string> {
+  const query = args.query.trim();
+  if (query === '') return 'Empty query: pass a symbol name fragment to search for.';
+  if (args.kind !== undefined && !SYMBOL_KINDS.has(args.kind)) {
+    return `Unknown kind '${args.kind}'. Valid kinds: ${[...SYMBOL_KINDS].join(', ')}.`;
+  }
+  const limit = clampLimit(args.limit);
+  const exact = db.searchSymbols(query, args.kind, limit + 1);
+  const seen = new Set(exact.map((r) => r.id));
+  const lexical = db.searchSymbolsFuzzy(query, args.kind, limit + 1).filter((r) => !seen.has(r.id));
+  for (const r of lexical) seen.add(r.id);
+  let semantic: SymbolRow[] = [];
+  let degraded = false;
+  if (embeddings !== undefined) {
+    try {
+      semantic = await semanticMatches(db, embeddings, query, args.kind, limit + 1, seen);
+    } catch {
+      degraded = true;
+    }
+  }
+  const similarCount = lexical.length + semantic.length;
+  if (exact.length === 0 && similarCount === 0) {
+    return `No symbols matching '${query}'${args.kind ? ` (kind=${args.kind})` : ''}. Safe to create.`;
+  }
+  let budget = limit;
+  const exactShown = exact.slice(0, budget);
+  budget -= exactShown.length;
+  const lexShown = lexical.slice(0, budget);
+  budget -= lexShown.length;
+  const semShown = semantic.slice(0, budget);
+  const cut = exact.length > exactShown.length || lexical.length > lexShown.length || semantic.length > semShown.length;
+  const lines: string[] = [];
+  if (exactShown.length > 0) {
+    lines.push(
+      similarCount === 0 && !cut
+        ? `Found ${exact.length} symbol(s) matching '${query}':`
+        : `Found ${exact.length + similarCount} symbol(s) matching '${query}' (${exact.length} exact + ${similarCount} similar):`,
+    );
+    lines.push(...exactShown.map(formatSymbolLine));
+  } else {
+    lines.push(`No exact matches for '${query}'; ${similarCount} similar:`);
+  }
+  if (lexShown.length > 0) {
+    lines.push('--- similar (lexical) ---', ...lexShown.map(formatSymbolLine));
+  }
+  if (semShown.length > 0) {
+    lines.push('--- similar (semantic) ---', ...semShown.map(formatSymbolLine));
+  }
+  if (cut) lines.push(`…more than ${limit} matches; narrow the query.`);
+  if (degraded) lines.push('(semantic tier unavailable: embedding provider failed)');
+  return truncateOutput(lines.join('\n'));
+}
+
+/** Top cosine-similar symbols with positive similarity, excluding seen ids. */
+async function semanticMatches(
+  db: ArgusDb,
+  provider: EmbeddingProvider,
+  query: string,
+  kind: string | undefined,
+  limit: number,
+  exclude: ReadonlySet<number>,
+): Promise<SymbolRow[]> {
+  const [qvec] = await provider.embed([query]);
+  if (qvec === undefined || qvec.length === 0) return [];
+  const scored: Array<{ id: number; sim: number }> = [];
+  for (const v of db.symbolVectors()) {
+    if (v.dim !== qvec.length || exclude.has(v.symbolId)) continue;
+    const sim = cosineSimilarity(qvec, v.vec);
+    if (sim > 0) scored.push({ id: v.symbolId, sim });
+  }
+  scored.sort((a, b) => b.sim - a.sim);
+  const out: SymbolRow[] = [];
+  for (const s of scored.slice(0, limit)) {
+    const row = db.symbolById(s.id);
+    if (row === undefined) continue;
+    if (kind !== undefined && row.kind !== kind) continue;
+    out.push(row);
+  }
+  return out;
 }
 
 export interface MapArgs {

@@ -5,6 +5,7 @@ import { extname, join, relative, sep } from 'node:path';
 import { watch, type FSWatcher } from 'chokidar';
 import { DB_FILENAME, EXTENSION_LANGUAGE, IGNORE_DIRS } from './config.js';
 import { ArgusDb, type NewRelationship, type NewSymbol } from './db.js';
+import { syncSymbolVectors, type EmbeddingProvider } from './embeddings.js';
 import type { ParserEngine } from './parser.js';
 
 export function sha256Hex(content: string): string {
@@ -123,12 +124,19 @@ export interface WatchHandle {
   ready: Promise<void>;
 }
 
+export interface WatchEmbedOpts {
+  embeddings?: EmbeddingProvider | undefined;
+  onVectorSync?: ((msg: string) => void) | undefined;
+  projectName?: string | undefined;
+}
+
 /** Live recorder: re-index on add/change, cascade-delete on unlink. */
 export function watchRoot(
   db: ArgusDb,
   engine: ParserEngine,
   root: string,
   onError?: (err: unknown) => void,
+  embedOpts?: WatchEmbedOpts | undefined,
 ): WatchHandle {
   const watcher = watch(root, {
     ignored: (path: string, stats) => {
@@ -148,7 +156,16 @@ export function watchRoot(
 
   const reindex = (absPath: string): void => {
     try {
-      indexFile(db, engine, root, absPath);
+      const outcome = indexFile(db, engine, root, absPath);
+      const provider = embedOpts?.embeddings;
+      if (outcome === 'updated' && provider !== undefined) {
+        const rel = toRelPath(root, absPath);
+        void syncSymbolVectors(db, provider, { path: rel }).catch((err: unknown) => {
+          embedOpts?.onVectorSync?.(
+            `project '${embedOpts?.projectName ?? '?'}': vector sync failed for ${rel}: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        });
+      }
     } catch (err) {
       onError?.(err);
     }

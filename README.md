@@ -180,14 +180,15 @@ Add this to the indexed project's `AGENTS.md` / `.cursorrules` so agents actuall
 
 > Before generating any new function, utility, module, or class, you MUST call the
 > `lookup_dictionary` MCP tool to check if equivalent or reusable code already exists in the
-> project. Never scan raw project files using shell commands (cat, grep, find) unless
-> explicitly requested for inline editing.
+> project. Use `mode: "hybrid"` when exploring (typo-tolerant + semantic matches);
+> default `exact` mode is enough when you know the name. Never scan raw project files
+> using shell commands (cat, grep, find) unless explicitly requested for inline editing.
 
 ## Tools
 
 | Tool | Parameters | Output |
 |---|---|---|
-| `lookup_dictionary` | `query` (string), `kind` (optional), `limit` (optional) | Matching signatures, file paths, line numbers, docstrings |
+| `lookup_dictionary` | `query` (string), `kind` (optional), `limit` (optional), `mode` (`exact`/`hybrid`, optional) | Matching signatures, file paths, line numbers, docstrings |
 | `get_codebase_map` | `module_path` (optional prefix), `limit` (optional) | Exported symbols + signatures per file |
 | `get_symbol_details` | `symbol_id` or `symbol_name` | Exact source block for one symbol |
 | `check_blast_radius` | `symbol_name`, `limit` (optional) | Incoming dependents + outgoing dependencies |
@@ -195,6 +196,34 @@ Add this to the indexed project's `AGENTS.md` / `.cursorrules` so agents actuall
 | `find_dead_code` | `include_exported` (optional), `limit` (optional) | Symbols nothing calls (conservative) |
 
 Outputs are token-budgeted (50 results / ~12k chars by default, with truncation notices).
+
+## Hybrid search
+
+`lookup_dictionary` has two modes. `exact` (default) is substring matching —
+unchanged, deterministic. `hybrid` adds two recall tiers after the exact hits:
+
+1. **Lexical** (always on, zero dependencies): token/prefix search over
+   names, signatures, and docstrings via SQLite FTS5, plus edit-distance typo
+   tolerance (`noramlize` finds `normalize`).
+2. **Semantic** (optional, local Ollama): embedding similarity for
+   conceptual queries ("retry with backoff" finds `withRetry` even when no
+   word overlaps). Vectors live in the project's own `.mcp-codebase.db`,
+   synced in the background; a model change is detected and resynced
+   automatically.
+
+Argus auto-probes `http://127.0.0.1:11434` at startup. No Ollama, no
+problem: the semantic tier stays off and everything else works.
+
+```bash
+argus --root /path/to/project --ollama                     # default local URL
+argus serve --root /path/to/project --ollama-model my-embed # custom model
+ARGUS_OLLAMA=off argus --root /path/to/project              # force exact+lexical
+# env knobs: ARGUS_OLLAMA_URL, ARGUS_OLLAMA_MODEL
+```
+
+Pull an embedding model first: `ollama pull nomic-embed-text`. In `serve`
+mode the server does all embedding work — agents just send query text, so
+one sidecar covers the whole team.
 
 ## Supported languages
 
@@ -232,13 +261,14 @@ src/
   admin/      Admin web UI (single static page, observe-only)
   projects.ts Multi-project index manager (isolated DB + watcher per project)
   tools.ts    The 6 tool handlers + analysis (duplicates, dead code)
+  embeddings.ts Optional semantic tier: provider interface, Ollama client, vector sync
   indexer.ts  SHA-256 delta sync + chokidar watcher
   parser.ts   Tree-sitter engine: symbols, signatures, docstrings, refs
   queries.ts  S-expression query packs per language
   config.ts   Language map, ignore rules, token budgets, argus.json parsing
   db.ts       SQLite schema + parameterized data access
-tests/        node:test suite (53 tests: parser fixtures, db, indexer, tools,
-              projects, config, http handler + live socket, watcher)
+tests/        node:test suite (80 tests: parser fixtures, db, indexer, tools,
+              projects, config, http handler + live socket, watcher, hybrid)
 ```
 
 ## Support

@@ -10,6 +10,7 @@ import {
   getCodebaseMap,
   getSymbolDetails,
   lookupDictionary,
+  lookupDictionaryHybrid,
 } from './tools.js';
 
 type TextResult = { content: Array<{ type: 'text'; text: string }> };
@@ -34,6 +35,22 @@ function withProject(
   }
 }
 
+/** Async variant for handlers awaiting the semantic tier. */
+async function withProjectAsync(
+  manager: IndexManager,
+  toolName: string,
+  project: string | undefined,
+  fn: (entry: ProjectEntry) => Promise<string>,
+): Promise<TextResult> {
+  const resolved = manager.resolve(project);
+  if ('error' in resolved) return toolResult(resolved.error);
+  try {
+    return toolResult(await fn(resolved.entry));
+  } catch (err) {
+    return toolResult(`${toolName} failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
 const projectField = z.string().optional().describe('Project name (required when several are configured)');
 
 /** Build an MCP server bound to the index manager (one instance per transport session). */
@@ -50,13 +67,23 @@ export function createMcpServer(manager: IndexManager, version: string): McpServ
         query: z.string().describe('Name/signature fragment to search for'),
         kind: z.string().optional().describe('Filter by kind: function, class, method, interface, struct, enum, ...'),
         limit: z.number().optional().describe('Max results (default 50)'),
+        mode: z
+          .enum(['exact', 'hybrid'])
+          .optional()
+          .describe('exact: substring match (default). hybrid: also adds typo-tolerant and semantic-similar matches.'),
         project: projectField,
       },
     },
-    (args) =>
-      Promise.resolve(
+    (args) => {
+      if (args.mode === 'hybrid') {
+        return withProjectAsync(manager, 'lookup_dictionary', args.project, (entry) =>
+          lookupDictionaryHybrid(entry.db, args, entry.embeddings),
+        );
+      }
+      return Promise.resolve(
         withProject(manager, 'lookup_dictionary', args.project, (entry) => lookupDictionary(entry.db, args)),
-      ),
+      );
+    },
   );
 
   server.registerTool(

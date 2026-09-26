@@ -42,6 +42,9 @@ export const LANGUAGE_WASM: Readonly<Record<LanguageId, { pkg: string; file: str
 
 export const DB_FILENAME = '.mcp-codebase.db';
 
+export const DEFAULT_OLLAMA_URL = 'http://127.0.0.1:11434';
+export const DEFAULT_OLLAMA_MODEL = 'nomic-embed-text';
+
 /** Directory names never indexed. */
 export const IGNORE_DIRS: ReadonlySet<string> = new Set([
   'node_modules',
@@ -163,6 +166,42 @@ export function parseConfigFile(jsonText: string, configDir: string): ArgusConfi
 }
 
 /** Shared bearer token for HTTP endpoints. Never read from config files. */
+export interface OllamaConfig {
+  url: string;
+  model: string;
+}
+
+/**
+ * Resolve the optional Ollama sidecar: --ollama[=url] / ARGUS_OLLAMA_URL,
+ * --ollama-model[=m] / ARGUS_OLLAMA_MODEL. Auto-probed when enabled, so a
+ * bare `--ollama` means "use the local default if it answers". Disabled by
+ * --no-semantic or ARGUS_OLLAMA=off (exact + lexical tiers still work).
+ */
+export function resolveOllama(argv: string[], env: NodeJS.ProcessEnv): OllamaConfig | undefined {
+  if (argv.includes('--no-semantic') || env['ARGUS_OLLAMA'] === 'off') return undefined;
+  let url = env['ARGUS_OLLAMA_URL'] !== '' ? (env['ARGUS_OLLAMA_URL'] ?? DEFAULT_OLLAMA_URL) : DEFAULT_OLLAMA_URL;
+  let model =
+    env['ARGUS_OLLAMA_MODEL'] !== '' ? (env['ARGUS_OLLAMA_MODEL'] ?? DEFAULT_OLLAMA_MODEL) : DEFAULT_OLLAMA_MODEL;
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === undefined) continue;
+    if (arg === '--ollama') {
+      const next = argv[i + 1];
+      if (next !== undefined && next !== '' && !next.startsWith('--')) url = next;
+    } else if (arg.startsWith('--ollama=')) {
+      const value = arg.slice('--ollama='.length);
+      if (value !== '') url = value;
+    } else if (arg === '--ollama-model') {
+      const next = argv[i + 1];
+      if (next !== undefined && next !== '' && !next.startsWith('--')) model = next;
+    } else if (arg.startsWith('--ollama-model=')) {
+      const value = arg.slice('--ollama-model='.length);
+      if (value !== '') model = value;
+    }
+  }
+  return { url, model };
+}
+
 export function resolveToken(argv: string[], env: NodeJS.ProcessEnv): string | undefined {
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];

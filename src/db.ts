@@ -71,6 +71,31 @@ CREATE INDEX IF NOT EXISTS idx_symbol_kind ON symbols(kind);
 CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols(file_id);
 CREATE INDEX IF NOT EXISTS idx_rel_caller ON symbol_relationships(caller_symbol_id);
 CREATE INDEX IF NOT EXISTS idx_rel_callee ON symbol_relationships(callee_name);
+CREATE TABLE IF NOT EXISTS symbol_vectors (
+  symbol_id INTEGER PRIMARY KEY,
+  dim INTEGER NOT NULL,
+  vec BLOB NOT NULL,
+  FOREIGN KEY(symbol_id) REFERENCES symbols(id) ON DELETE CASCADE
+);
+`;
+
+/**
+ * Lexical search index over names/signatures/docstrings, kept in sync with
+ * `symbols` by triggers. Separate from SCHEMA: on builds without FTS5 the
+ * table setup throws and the caller falls back to LIKE + edit distance.
+ */
+const FTS_SCHEMA = `
+CREATE VIRTUAL TABLE IF NOT EXISTS symbols_fts USING fts5(name, signature, docstring, content='symbols', content_rowid='id');
+CREATE TRIGGER IF NOT EXISTS symbols_fts_ai AFTER INSERT ON symbols BEGIN
+  INSERT INTO symbols_fts(rowid, name, signature, docstring) VALUES (new.id, new.name, new.signature, new.docstring);
+END;
+CREATE TRIGGER IF NOT EXISTS symbols_fts_ad AFTER DELETE ON symbols BEGIN
+  INSERT INTO symbols_fts(symbols_fts, rowid, name, signature, docstring) VALUES('delete', old.id, old.name, old.signature, old.docstring);
+END;
+CREATE TRIGGER IF NOT EXISTS symbols_fts_au AFTER UPDATE ON symbols BEGIN
+  INSERT INTO symbols_fts(symbols_fts, rowid, name, signature, docstring) VALUES('delete', old.id, old.name, old.signature, old.docstring);
+  INSERT INTO symbols_fts(rowid, name, signature, docstring) VALUES (new.id, new.name, new.signature, new.docstring);
+END;
 `;
 
 /** node:sqlite returns untyped records; validate shapes at the boundary. */
@@ -113,6 +138,12 @@ function toSymbolRow(value: unknown): SymbolRow {
   };
 }
 
+export interface SymbolVector {
+  symbolId: number;
+  dim: number;
+  vec: number[];
+}
+
 export interface RelationRow {
   caller_id: number;
   caller_name: string;
@@ -139,12 +170,98 @@ export function escapeLike(raw: string): string {
   return raw.replace(/\\/g, '\\\\').replace(/%/g, '\\%').replace(/_/g, '\\_');
 }
 
+/** Lowercase alphanumeric tokens; FTS5-safe by construction (no syntax chars survive). */
+export function lexicalTokens(raw: string): string[] {
+  return [...new Set(raw.toLowerCase().match(/[a-z0-9]+/g) ?? [])];
+}
+
+/** Unqualified name (mirrors parser.simpleName without the import). */
+function baseName(qualified: string): string {
+  const dot = qualified.lastIndexOf('.');
+  return dot >= 0 ? qualified.slice(dot + 1) : qualified;
+}
+
+/** Typo budget per token: short tokens allow 1 edit, longer ones 2. */
+function editBudget(token: string): number {
+  return token.length <= 4 ? 1 : 2;
+}
+
+/**
+ * Levenshtein distance capped at max+1, with early exit. Small names make the
+ * full scan cheap; the cap keeps pathological pairs from dominating.
+ */
+export function cappedEditDistance(a: string, b: string, max: number): number {
+  if (Math.abs(a.length - b.length) > max) return max + 1;
+  let prev: number[] = Array.from({ length: b.length + 1 }, (_, i) => i);
+  for (let i = 1; i <= a.length; i++) {
+    const curr: number[] = [i];
+    let rowMin = i;
+    for (let j = 1; j <= b.length; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      const v = Math.min(prev[j] as number + 1, (curr[j - 1] as number) + 1, (prev[j - 1] as number) + cost);
+      curr.push(v);
+      if (v < rowMin) rowMin = v;
+    }
+    if (rowMin > max) return max + 1;
+    prev = curr;
+  }
+  return prev[b.length] as number;
+}
+
+function encodeVector(vec: number[]): Buffer {
+  return Buffer.from(new Float64Array(vec).buffer);
+}
+
+function decodeVector(value: unknown, dim: number): number[] {
+  if (!(value instanceof Uint8Array) || value.byteLength !== dim * 8) {
+    throw new Error('DB row: malformed vector blob');
+  }
+  const view = new Float64Array(value.buffer, value.byteOffset, dim);
+  return [...view];
+}
+
+function toSymbolVector(value: unknown): SymbolVector {
+  if (!isRecord(value)) throw new Error('DB row: expected record');
+  const dim = reqNumber(value, 'dim');
+  return { symbolId: reqNumber(value, 'symbol_id'), dim, vec: decodeVector(value['vec'], dim) };
+}
+
 export class ArgusDb {
   private readonly db: DatabaseSync;
+  private ftsReady = false;
 
   constructor(dbPath: string) {
     this.db = new DatabaseSync(dbPath);
     this.db.exec(SCHEMA);
+    this.setupFts();
+  }
+
+  private setupFts(): void {
+    try {
+      // Pre-FTS databases lack the sync triggers: index once after creating
+      // them. (COUNT(*) on the FTS table itself is useless here — without a
+      // MATCH clause it reads through to the content table.)
+      const row = this.db
+        .prepare(
+          `SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'trigger'
+           AND name IN ('symbols_fts_ai', 'symbols_fts_ad', 'symbols_fts_au')`,
+        )
+        .get();
+      if (!isRecord(row)) throw new Error('DB row: expected record');
+      const hadTriggers = reqNumber(row, 'n');
+      this.db.exec(FTS_SCHEMA);
+      if (hadTriggers === 0) {
+        this.db.exec(`INSERT INTO symbols_fts(symbols_fts) VALUES('rebuild')`);
+      }
+      this.ftsReady = true;
+    } catch {
+      this.ftsReady = false;
+    }
+  }
+
+  /** False on SQLite builds without FTS5 (lexical tier degrades to edit distance). */
+  get ftsAvailable(): boolean {
+    return this.ftsReady;
   }
 
   close(): void {
@@ -294,6 +411,102 @@ export class ArgusDb {
       ? this.db.prepare(sql).all(like, like, limit)
       : this.db.prepare(sql).all(like, like, kind, limit);
     return rows.map(toSymbolRow);
+  }
+
+  /**
+   * Lexical tier: FTS5 token/prefix matches over name+signature+docstring
+   * (bm25 order), then edit-distance typo matches on names. Never throws on
+   * query syntax: tokens are alphanumeric-only by construction.
+   */
+  searchSymbolsFuzzy(query: string, kind: string | undefined, limit: number): SymbolRow[] {
+    const terms = lexicalTokens(query);
+    if (terms.length === 0 || limit <= 0) return [];
+    const seen = new Map<number, SymbolRow>();
+    if (this.ftsReady) {
+      try {
+        for (const row of this.ftsMatch(terms, kind, limit)) seen.set(row.id, row);
+      } catch {
+        // Corrupt FTS index: edit distance below still answers.
+      }
+    }
+    for (const row of this.editDistanceMatch(terms, kind, limit, seen)) seen.set(row.id, row);
+    return [...seen.values()].slice(0, limit);
+  }
+
+  private ftsMatch(terms: string[], kind: string | undefined, limit: number): SymbolRow[] {
+    const match = terms.map((t) => `"${t}"*`).join(' OR ');
+    const sql = kind === undefined
+      ? `SELECT s.*, f.path FROM symbols_fts
+         JOIN symbols s ON s.id = symbols_fts.rowid
+         JOIN files f ON f.id = s.file_id
+         WHERE symbols_fts MATCH ? ORDER BY bm25(symbols_fts) LIMIT ?`
+      : `SELECT s.*, f.path FROM symbols_fts
+         JOIN symbols s ON s.id = symbols_fts.rowid
+         JOIN files f ON f.id = s.file_id
+         WHERE symbols_fts MATCH ? AND s.kind = ? ORDER BY bm25(symbols_fts) LIMIT ?`;
+    const rows = kind === undefined
+      ? this.db.prepare(sql).all(match, limit)
+      : this.db.prepare(sql).all(match, kind, limit);
+    return rows.map(toSymbolRow);
+  }
+
+  private editDistanceMatch(
+    terms: string[],
+    kind: string | undefined,
+    limit: number,
+    exclude: ReadonlyMap<number, SymbolRow>,
+  ): SymbolRow[] {
+    const scored: Array<{ row: SymbolRow; dist: number }> = [];
+    for (const row of this.allSymbols()) {
+      if (exclude.has(row.id)) continue;
+      if (kind !== undefined && row.kind !== kind) continue;
+      const candidates = [row.name.toLowerCase(), baseName(row.name).toLowerCase()];
+      let best = Number.POSITIVE_INFINITY;
+      for (const term of terms) {
+        const budget = editBudget(term);
+        for (const cand of candidates) {
+          // Gate on the per-term budget: cappedEditDistance returns budget+1
+          // on overflow, which must not qualify.
+          const d = cappedEditDistance(term, cand, budget);
+          if (d <= budget && d < best) best = d;
+        }
+      }
+      if (best <= 2) scored.push({ row, dist: best });
+    }
+    scored.sort(
+      (a, b) => a.dist - b.dist || b.row.is_exported - a.row.is_exported || (a.row.name < b.row.name ? -1 : 1),
+    );
+    return scored.slice(0, limit).map((s) => s.row);
+  }
+
+  /** Upsert embedding vectors keyed by symbol id. */
+  replaceVectors(rows: SymbolVector[]): void {
+    if (rows.length === 0) return;
+    const stmt = this.db.prepare(
+      'INSERT INTO symbol_vectors (symbol_id, dim, vec) VALUES (?, ?, ?) ON CONFLICT(symbol_id) DO UPDATE SET dim = excluded.dim, vec = excluded.vec',
+    );
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      for (const r of rows) stmt.run(r.symbolId, r.dim, encodeVector(r.vec));
+      this.db.exec('COMMIT');
+    } catch (err) {
+      this.db.exec('ROLLBACK');
+      throw err;
+    }
+  }
+
+  symbolVectors(): SymbolVector[] {
+    return this.db.prepare('SELECT symbol_id, dim, vec FROM symbol_vectors').all().map(toSymbolVector);
+  }
+
+  countVectors(): number {
+    return this.count('SELECT COUNT(*) AS n FROM symbol_vectors');
+  }
+
+  /** Drop vectors whose dimension differs (embedding model changed); returns rows cleared. */
+  clearVectorDimsExcept(dim: number): number {
+    const r = this.db.prepare('DELETE FROM symbol_vectors WHERE dim != ?').run(dim);
+    return Number(r.changes ?? 0);
   }
 
   exportedSymbolsByFile(prefix: string | undefined, limit: number): SymbolRow[] {

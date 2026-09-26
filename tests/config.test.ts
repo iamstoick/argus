@@ -1,7 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { defaultProjectName, flagValue, hasFlag, parseServeArgs } from '../src/cli.js';
-import { isValidProjectName, parseConfigFile, resolveToken } from '../src/config.js';
+import { isValidProjectName, parseConfigFile, resolveOllama, resolveToken } from '../src/config.js';
 
 describe('parseConfigFile', () => {
   it('accepts a valid config and resolves relative paths', () => {
@@ -58,6 +58,32 @@ describe('resolveToken', () => {
     assert.equal(resolveToken(['--token', 'abc'], { ARGUS_TOKEN: 'env' }), 'abc');
     assert.equal(resolveToken([], {}), undefined);
     assert.equal(resolveToken([], { ARGUS_TOKEN: '' }), undefined);
+  });
+});
+
+describe('resolveOllama', () => {
+  it('defaults to the local Ollama and honors overrides', () => {
+    assert.deepEqual(resolveOllama([], {}), { url: 'http://127.0.0.1:11434', model: 'nomic-embed-text' });
+    assert.deepEqual(resolveOllama(['--ollama'], {}), { url: 'http://127.0.0.1:11434', model: 'nomic-embed-text' });
+    // A bare --ollama never swallows the next flag as its URL.
+    assert.deepEqual(resolveOllama(['--ollama', '--port', '3000'], {}), {
+      url: 'http://127.0.0.1:11434',
+      model: 'nomic-embed-text',
+    });
+    assert.deepEqual(resolveOllama(['--ollama', 'http://x:11434'], {}), {
+      url: 'http://x:11434',
+      model: 'nomic-embed-text',
+    });
+    assert.deepEqual(resolveOllama(['--ollama=http://y:11434', '--ollama-model=m'], {}), {
+      url: 'http://y:11434',
+      model: 'm',
+    });
+    assert.deepEqual(resolveOllama([], { ARGUS_OLLAMA_URL: 'http://z:11434', ARGUS_OLLAMA_MODEL: 'e' }), {
+      url: 'http://z:11434',
+      model: 'e',
+    });
+    assert.equal(resolveOllama(['--no-semantic'], {}), undefined);
+    assert.equal(resolveOllama([], { ARGUS_OLLAMA: 'off' }), undefined);
   });
 });
 
