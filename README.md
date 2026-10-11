@@ -103,7 +103,7 @@ npm run build
 }
 ```
 
-or via CLI: `Claude mcp add argus -- node /path/to/argus/dist/src/index.js --root /path/to/project`
+or via CLI: `claude mcp add argus -- node /path/to/argus/dist/src/index.js --root /path/to/project`
 
 **Remote agents against `serve` mode** — Streamable HTTP entry (Muse
 `~/.config/muse/settings.json`, or any MCP client with HTTP support):
