@@ -421,7 +421,7 @@ a **new** code file. Mechanics, so there are no surprises:
 
 ## Tools
 
-Seven tools, all read-only against your source tree. Every tool also accepts
+Eight tools, all read-only against your source tree. Every tool also accepts
 the optional `project` selector on multi-project servers (see
 [Client setup](#client-setup)).
 
@@ -429,6 +429,7 @@ the optional `project` selector on multi-project servers (see
 |---|---|---|
 | `lookup_dictionary` | `query` (string), `kind` (optional), `limit` (optional), `mode` (`exact`/`hybrid`, optional) | Matching signatures, file paths, line numbers, docstrings |
 | `get_codebase_map` | `module_path` (optional prefix), `limit` (optional) | Exported symbols + signatures per file |
+| `get_project_brief` | `limit` (optional) | Orientation digest: size, languages, hubs, drift, audits, activity |
 | `get_symbol_details` | `symbol_id` or `symbol_name` | Exact source block for one symbol |
 | `check_blast_radius` | `symbol_name`, `limit` (optional) | Incoming dependents + outgoing dependencies |
 | `find_duplicates` | `limit` (optional) | Symbols sharing normalized name + signature |
@@ -438,7 +439,9 @@ the optional `project` selector on multi-project servers (see
 **Budgets (all tools).** `limit` defaults to 50 and clamps to 1–200; whole
 outputs cap at ~12,000 chars with a `…(truncated N chars; refine the query or
 raise the limit)` notice. Signatures are stored truncated to 500 chars and
-docstrings to 1000 chars at index time.
+docstrings to 1000 chars at index time. Exception: `get_project_brief`'s
+`limit` is entries *per section* (default 8, max 10), since a digest with 50
+rows per section would defeat its purpose.
 
 ### `lookup_dictionary`
 
@@ -458,6 +461,16 @@ Architecture overview: **exported** symbols only, grouped by file, ordered by
 path and line. `module_path` restricts to a path prefix (`src/auth`). Empty
 index? `Index is empty: no exported symbols found. The workspace may still be
 syncing.`
+
+### `get_project_brief`
+
+Orientation digest for an unfamiliar project — call it first in a new repo.
+Assembled live from the index (never stale, no storage, no LLM credentials
+needed since the calling agent does the narrating): file/symbol/call counts,
+languages, symbols by kind, largest files, most-referenced symbols (with
+declaration sites), latest snapshot drift, audit posture per kind, and what
+agents recently asked about. `limit` sets entries per section (default 8,
+max 10); the whole brief stays a few thousand chars.
 
 ### `get_symbol_details`
 
@@ -569,6 +582,11 @@ whole team.
   reattach instead of rebuilding. Until the index is ready (or on any
   mismatch), queries transparently fall back to brute-force cosine — recall
   first, speed second.
+- Ranking quality is guarded two ways: a fast recall gate inside `npm test`
+  (`tests/hnsw.test.ts`) plus a deeper benchmark — `npm run benchmark`
+  builds, then measures HNSW-vs-brute-force recall@10, latency percentiles,
+  and speedup on 4000 synthetic points (deterministic seed, ~10s). It exits
+  nonzero when mean recall drops below 0.9, so it fits in CI as a perf gate.
 
 ## Observe & evolve
 
@@ -650,17 +668,29 @@ diffs any two.
 
 ### Background audits
 
-In `serve` mode a worker precomputes dead-code (unexported) and duplicate
-reports on startup and every `--audit-interval` seconds (default 300;
-`ARGUS_AUDIT_INTERVAL`; `0` disables; off by default in stdio mode — look
-for `[argus] audit worker every 300s …`). Each kind keeps its 10 newest
-reports; each report holds the top 50 findings. Failures are logged and
-skipped, per kind.
+In `serve` mode a worker precomputes dead-code (unexported), duplicate, and
+suspected-secret reports on startup and every `--audit-interval` seconds
+(default 300; `ARGUS_AUDIT_INTERVAL`; `0` disables; off by default in stdio
+mode — look for `[argus] audit worker every 300s …`). Each kind keeps its 10
+newest reports; each report holds the top 50 findings. Failures are logged
+and skipped, per kind.
+
+The `secrets` scan is flag-only: it never edits or redacts your code, and
+stored findings carry a `[REDACTED]` preview — the raw secret never lands in
+the database. It matches fixed-format provider tokens (AWS, GitHub, Slack,
+Stripe, OpenAI, JWTs, private-key headers) plus `api_key`/`secret`/`token` /
+`password` assignments, with placeholder filtering (`changeme`, `xxx`,
+`${VAR}`, …) and code-shape guards so `password: string` annotations and
+`apiKey = getDefaultKey()` stay quiet. Scanning is incremental: only files
+whose content hash changed are re-read (state in `secret_scan_state`), files
+over 256 KB and binaries are skipped, and findings for unchanged files carry
+forward from the previous report.
 
 ```bash
 curl -H "Authorization: Bearer $ARGUS_TOKEN" \
   "http://127.0.0.1:3000/api/projects/web/audit"
-# { "reports": [{ "kind": "dead-code"|"duplicates", "takenAt", "payload": { "symbols"|"groups", "truncated" } }] }
+# { "reports": [{ "kind": "dead-code"|"duplicates"|"secrets", "takenAt",
+#                 "payload": { "symbols"|"groups"|"findings", "truncated", ... } }] }
 ```
 
 ## Admin UI & HTTP API
@@ -683,6 +713,7 @@ observe-only except snapshot capture — it never edits your code.
 | `GET /api/projects/<n>/search` | `q` (required), `kind`, `limit` | `{ symbols: […] }` (exact matching, like `mode: "exact"`) |
 | `GET /api/projects/<n>/symbols/<id>` | — | `{ symbol, code }` (`code` is null when the file is unreadable) |
 | `GET /api/projects/<n>/blast` | `name` (required), `limit` | `{ matched, outgoing, incoming, incomingTruncated }` |
+| `GET /api/projects/<n>/brief` | `limit` (entries per section, default 8, max 10) | Project-brief JSON (`project`, `languages`, `topFiles`, `mostReferenced`, `drift`, `audits`, `queries`) |
 | `GET /api/projects/<n>/duplicates` | `limit` | `{ groups, truncated }` |
 | `GET /api/projects/<n>/dead-code` | `limit`, `include_exported=true` | `{ symbols, truncated }` |
 | `GET /api/projects/<n>/queries` | `limit` | `{ stats, queries, embeddingUsage }` (see [Observe & evolve](#observe--evolve)) |
@@ -748,8 +779,8 @@ Gitignore all three:
 `symbol_relationships`, `symbol_vectors` + `vector_index` (semantic tier +
 persisted HNSW graph), `query_log` (telemetry, 1000 rows), `embedding_usage`
 (cumulative embedding counters), `snapshots` (drift history, 20 kept),
-`audit_reports` (10 per kind). Vectors dominate size (`dim × 8 bytes` per
-symbol plus the HNSW graph).
+`audit_reports` (10 per kind), `secret_scan_state` (per-file scan watermarks).
+Vectors dominate size (`dim × 8 bytes` per symbol plus the HNSW graph).
 
 **Sharing / backup:** stop the server, copy all three sidecars together (a
 live `-wal` copied alone is inconsistent), drop them at the recipient's
@@ -863,11 +894,13 @@ src/
   http.ts     HTTP: MCP Streamable, JSON API, admin page, token auth
   admin/      Admin web UI (single static page, observe-only)
   projects.ts Multi-project index manager (isolated DB + watcher per project)
-  tools.ts    The 7 tool handlers + analysis (duplicates, dead code, diffs)
+  tools.ts    Tool handlers + analysis (duplicates, dead code, diffs)
+  brief.ts    Project-brief digest (MCP tool + JSON API shape)
+  secrets.ts  Secret-scan patterns + incremental project scan
   embeddings.ts Optional semantic tier: providers (Ollama, OpenAI), vector sync
   hnsw.ts     Deterministic HNSW ANN index (pure TS, no native deps)
   vectorIndex.ts Per-project ANN wrapper: incremental sync + SQLite persistence
-  worker.ts   Background audit worker (dead-code + duplicates reports)
+  worker.ts   Background audit worker (dead-code + duplicates + secrets reports)
   indexer.ts  SHA-256 delta sync + chokidar watcher
   parser.ts   Tree-sitter engine: symbols, signatures, docstrings, refs
   queries.ts  S-expression query packs per language
@@ -876,7 +909,8 @@ src/
 examples/     Claude Code hook (index-first nudge) + settings snippet
 tests/        node:test suite: parser fixtures, db, indexer, tools, projects,
               config, http handler + live socket, watcher, hybrid, embeddings
-              providers, telemetry, snapshots, audits, HNSW, init
+              providers, telemetry, snapshots, audits, HNSW, init, brief, secrets
+benchmark/    ANN recall benchmark (`npm run benchmark`; outside `npm test`)
 ```
 
 ## Support

@@ -123,6 +123,11 @@ CREATE TABLE IF NOT EXISTS embedding_usage (
   reported_calls INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (operation, provider, model)
 );
+CREATE TABLE IF NOT EXISTS secret_scan_state (
+  path TEXT PRIMARY KEY,
+  hash TEXT NOT NULL,
+  scanned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
 `;
 
 /**
@@ -223,6 +228,18 @@ export interface QueryStats {
   estTokens: number;
   degraded: number;
   errors: number;
+}
+
+/** One callee name with its incoming-reference count (codebase hubs). */
+export interface CalleeRefCount {
+  name: string;
+  refs: number;
+}
+
+/** One indexed file with its declared-symbol count. */
+export interface FileSymbolCount {
+  path: string;
+  symbols: number;
 }
 
 export type EmbeddingOperation = 'sync' | 'query';
@@ -509,6 +526,63 @@ export class ArgusDb {
       out[reqString(row, 'kind')] = reqNumber(row, 'n');
     }
     return out;
+  }
+
+  countExported(): number {
+    return this.count('SELECT COUNT(*) AS n FROM symbols WHERE is_exported = 1');
+  }
+
+  /** Callee names ranked by incoming-reference count (the codebase's hubs). */
+  topReferencedCallees(limit: number): CalleeRefCount[] {
+    const out: CalleeRefCount[] = [];
+    for (const row of this.db
+      .prepare(
+        `SELECT callee_name AS name, COUNT(*) AS n FROM symbol_relationships
+         GROUP BY callee_name ORDER BY n DESC, name LIMIT ?`,
+      )
+      .all(Math.max(0, Math.floor(limit)))) {
+      if (!isRecord(row)) throw new Error('DB row: expected record');
+      out.push({ name: reqString(row, 'name'), refs: reqNumber(row, 'n') });
+    }
+    return out;
+  }
+
+  /** Indexed files ranked by declared-symbol count. */
+  topFilesBySymbols(limit: number): FileSymbolCount[] {
+    const out: FileSymbolCount[] = [];
+    for (const row of this.db
+      .prepare(
+        `SELECT f.path AS path, COUNT(s.id) AS n FROM files f
+         LEFT JOIN symbols s ON s.file_id = f.id
+         GROUP BY f.path ORDER BY n DESC, f.path LIMIT ?`,
+      )
+      .all(Math.max(0, Math.floor(limit)))) {
+      if (!isRecord(row)) throw new Error('DB row: expected record');
+      out.push({ path: reqString(row, 'path'), symbols: reqNumber(row, 'n') });
+    }
+    return out;
+  }
+
+  /** Content hash at the last secret scan, or undefined when never scanned. */
+  secretScanHash(path: string): string | undefined {
+    const row = this.db.prepare('SELECT hash FROM secret_scan_state WHERE path = ?').get(path);
+    if (row === undefined || !isRecord(row)) return undefined;
+    return reqString(row, 'hash');
+  }
+
+  setSecretScanHash(path: string, hash: string): void {
+    this.db
+      .prepare(
+        `INSERT INTO secret_scan_state (path, hash, scanned_at) VALUES (?, ?, CURRENT_TIMESTAMP)
+         ON CONFLICT(path) DO UPDATE SET hash = excluded.hash, scanned_at = CURRENT_TIMESTAMP`,
+      )
+      .run(path, hash);
+  }
+
+  /** Drop scan state for files no longer in the index; returns rows removed. */
+  pruneSecretScanState(): number {
+    const r = this.db.prepare('DELETE FROM secret_scan_state WHERE path NOT IN (SELECT path FROM files)').run();
+    return Number(r.changes ?? 0);
   }
 
   /** Every symbol with its file path, for whole-index analyses. */

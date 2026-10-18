@@ -9,6 +9,7 @@ import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 import { SYMBOL_KINDS, clampLimit, isValidProjectName } from './config.js';
 import type { IndexManager } from './projects.js';
 import { createMcpServer } from './server.js';
+import { projectBriefData } from './brief.js';
 import { blastRadiusData, deadCodeData, duplicateGroupsData, snapshotDiffData, symbolCodeBlock } from './tools.js';
 
 export interface HttpOptions {
@@ -160,7 +161,7 @@ export function createRequestHandler(
       sendJson(res, 200, { version: opts.version, ...manager.health() });
       return;
     }
-    const match = /^\/api\/projects\/([^/]+)\/(search|symbols|blast|duplicates|dead-code|queries|snapshots|audit)(?:\/([^/]+))?$/.exec(
+    const match = /^\/api\/projects\/([^/]+)\/(search|symbols|blast|brief|duplicates|dead-code|queries|snapshots|audit)(?:\/([^/]+))?$/.exec(
       url.pathname,
     );
     const seg1 = match?.[1];
@@ -209,6 +210,11 @@ export function createRequestHandler(
         return;
       }
       sendJson(res, 200, { symbol: row, code: symbolCodeBlock(entry.root, row) ?? null });
+      return;
+    }
+    if (action === 'brief') {
+      const raw = Number(url.searchParams.get('limit') ?? Number.NaN);
+      sendJson(res, 200, projectBriefData(entry.db, projectName, Number.isInteger(raw) ? raw : undefined));
       return;
     }
     if (action === 'duplicates') {

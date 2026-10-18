@@ -2,6 +2,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
+import { getProjectBrief } from './brief.js';
 import type { IndexManager, ProjectEntry } from './projects.js';
 import {
   checkBlastRadius,
@@ -150,6 +151,24 @@ export function createMcpServer(manager: IndexManager, version: string): McpServ
     (args) =>
       Promise.resolve(
         withProject(manager, 'get_codebase_map', args.project, (entry) => getCodebaseMap(entry.db, args)),
+      ),
+  );
+
+  server.registerTool(
+    'get_project_brief',
+    {
+      description:
+        'Orientation digest for an unfamiliar project: size, languages, largest files, most-referenced symbols, latest drift, audit posture, and recent agent activity.',
+      inputSchema: {
+        limit: z.number().optional().describe('Entries per section (default 8, max 10)'),
+        project: projectField,
+      },
+    },
+    (args) =>
+      Promise.resolve(
+        withProject(manager, 'get_project_brief', args.project, (entry) =>
+          getProjectBrief(entry.db, entry.name, args),
+        ),
       ),
   );
 

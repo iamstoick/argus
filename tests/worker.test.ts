@@ -108,7 +108,11 @@ describe('audit worker wiring', () => {
       const errors: string[] = [];
       const handle = startAuditWorker(manager, 20, (msg) => errors.push(msg));
       try {
-        assert.equal(entry.db.latestAuditReports().length, 2); // immediate first run
+        // Immediate first run: structural kinds plus the secret scan (the tick passes the root).
+        assert.deepEqual(
+          entry.db.latestAuditReports().map((r) => r.kind).sort(),
+          ['dead-code', 'duplicates', 'secrets'],
+        );
         const repeated = await pollFor(() => entry.db.auditHistory('dead-code', 10).length >= 3, 2000);
         assert.equal(repeated, true);
         assert.deepEqual(errors, []);

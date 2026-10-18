@@ -468,6 +468,14 @@ async function loadAudit() {
         html += groups.length === 0 ? "<p>None found.</p>" : "<ul class=\"refs\">" +
           groups.slice(0, 20).map((g) => "<li><code>" + esc(g.key) + "</code> ×" + g.symbols.length + " <span class=\"mono\">" +
             g.symbols.map((s) => esc(s.path) + ":" + s.start_line).join(", ") + "</span></li>").join("") + "</ul>";
+      } else if (r.kind === "secrets") {
+        const findings = (r.payload && r.payload.findings) || [];
+        const meta = r.payload ? " <span class=\"mono\">(scanned " + r.payload.scanned + ", unchanged " + r.payload.unchanged +
+          ", skipped " + (r.payload.skippedLarge + r.payload.unreadable) + ", deferred " + r.payload.deferred + ")</span>" : "";
+        html += "<h3>Suspected secrets (" + findings.length + (r.payload && r.payload.truncated ? "+ " : " ") + ")" + meta + "</h3>";
+        html += findings.length === 0 ? "<p>None found.</p>" : "<ul class=\"refs\">" +
+          findings.slice(0, 20).map((f) => "<li><code>" + esc(f.kind) + "</code> <span class=\"mono\">" + esc(f.path) + ":" + f.line +
+            "</span><br><span class=\"sig\">" + esc(f.preview) + "</span></li>").join("") + "</ul>";
       }
     }
     $("audit").innerHTML = html;
