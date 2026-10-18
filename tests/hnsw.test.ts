@@ -237,7 +237,14 @@ describe('VectorIndex', () => {
     try {
       const index = VectorIndex.empty();
       await index.sync(db);
-      const provider: EmbeddingProvider = { name: 'stub', embed: (texts) => Promise.resolve(texts.map(() => [1, 0, 0, 0])) };
+      const provider: EmbeddingProvider = {
+        name: 'stub',
+        embed: (texts) =>
+          Promise.resolve({
+            vectors: texts.map(() => [1, 0, 0, 0]),
+            usage: { provider: 'stub', model: 'stub-m', inputTexts: texts.length, inputChars: 0 },
+          }),
+      };
       const stats: HybridStats = { exact: 0, lexical: 0, semantic: 0, degraded: false };
       const out = await lookupDictionaryHybrid(db, { query: 'qqq zzz' }, provider, stats, index);
       assert.match(out, /similar \(semantic\)/);

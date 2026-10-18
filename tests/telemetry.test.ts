@@ -29,6 +29,7 @@ describe('query_log storage', () => {
         byTool: {},
         avgLatencyMs: 0,
         totalChars: 0,
+        estTokens: 0,
         degraded: 0,
         errors: 0,
       });
@@ -47,12 +48,56 @@ describe('query_log storage', () => {
         byTool: { lookup_dictionary: 2, find_dead_code: 1 },
         avgLatencyMs: 20,
         totalChars: 180,
+        estTokens: 45,
         degraded: 0,
         errors: 1,
       });
       assert.equal(db.pruneQueryLog(2), 1);
       assert.equal(db.recentQueries(10).length, 2);
       assert.equal(db.pruneQueryLog(0), 0);
+    } finally {
+      db.close();
+    }
+  });
+});
+
+describe('embedding_usage storage', () => {
+  it('accumulates counters per operation, provider, and model', () => {
+    const db = new ArgusDb(':memory:');
+    try {
+      assert.deepEqual(db.embeddingUsageStats(), []);
+      db.addEmbeddingUsage('sync', { provider: 'ollama', model: 'nomic', inputTexts: 2, inputChars: 40 });
+      db.addEmbeddingUsage('sync', {
+        provider: 'ollama',
+        model: 'nomic',
+        inputTexts: 3,
+        inputChars: 60,
+        promptTokens: 25,
+      });
+      db.addEmbeddingUsage('query', {
+        provider: 'openai',
+        model: 'e5',
+        inputTexts: 1,
+        inputChars: 8,
+        promptTokens: 3,
+      });
+      const rows = db.embeddingUsageStats();
+      assert.equal(rows.length, 2);
+      const sync = rows.find((r) => r.operation === 'sync');
+      assert.deepEqual(sync, {
+        operation: 'sync',
+        provider: 'ollama',
+        model: 'nomic',
+        calls: 2,
+        texts: 5,
+        chars: 100,
+        promptTokens: 25,
+        reportedCalls: 1,
+        estTokens: 25,
+      });
+      const query = rows.find((r) => r.operation === 'query');
+      assert.equal(query?.promptTokens, 3);
+      assert.equal(query?.reportedCalls, 1);
     } finally {
       db.close();
     }
@@ -81,6 +126,36 @@ describe('hybrid tier stats', () => {
       const out = await lookupDictionaryHybrid(db, { query: 'getUser' }, undefined, stats);
       assert.match(out, /getUser/);
       assert.deepEqual(stats, { exact: 1, lexical: 0, semantic: 0, degraded: false });
+    } finally {
+      db.close();
+    }
+  });
+
+  it('records query-side embedding usage from hybrid calls', async () => {
+    const db = seed();
+    try {
+      const reporting: EmbeddingProvider = {
+        name: 'reported',
+        embed: (texts: string[]) =>
+          Promise.resolve({
+            vectors: texts.map(() => [1, 0]),
+            usage: { provider: 'reported', model: 'rm', inputTexts: texts.length, inputChars: 7, promptTokens: 2 },
+          }),
+      };
+      await lookupDictionaryHybrid(db, { query: 'getUser' }, reporting);
+      const rows = db.embeddingUsageStats();
+      assert.equal(rows.length, 1);
+      assert.deepEqual(rows[0], {
+        operation: 'query',
+        provider: 'reported',
+        model: 'rm',
+        calls: 1,
+        texts: 1,
+        chars: 7,
+        promptTokens: 2,
+        reportedCalls: 1,
+        estTokens: 2,
+      });
     } finally {
       db.close();
     }
@@ -179,12 +254,15 @@ describe('telemetry wiring', () => {
       await handler(req as unknown as IncomingMessage, res as unknown as ServerResponse);
       assert.equal(res.statusCode, 200);
       const parsed = JSON.parse(res.body) as {
-        stats: { total: number };
+        stats: { total: number; estTokens: number };
         queries: Array<{ tool: string; chars: number }>;
+        embeddingUsage: Array<{ operation: string; promptTokens: number }>;
       };
       assert.equal(parsed.stats.total, 1);
+      assert.equal(parsed.stats.estTokens, 3);
       assert.equal(parsed.queries.length, 1);
       assert.equal(parsed.queries[0]?.tool, 'find_duplicates');
+      assert.deepEqual(parsed.embeddingUsage, []);
     } finally {
       await manager.close();
       rmSync(root, { recursive: true, force: true });

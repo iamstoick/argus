@@ -134,6 +134,7 @@ describe('OpenAIEmbeddings', () => {
               { embedding: [0.3, 0.4], index: 1 },
               { embedding: [0.1, 0.2], index: 0 },
             ],
+            usage: { prompt_tokens: 12, total_tokens: 12 },
           },
         };
       }));
@@ -145,11 +146,18 @@ describe('OpenAIEmbeddings', () => {
       throw err;
     }
     try {
-      const vecs = await new OpenAIEmbeddings(`http://127.0.0.1:${port}/v1/`, 'e5', 'secret').embed(['a', 'b']);
-      assert.deepEqual(vecs, [
+      const res = await new OpenAIEmbeddings(`http://127.0.0.1:${port}/v1/`, 'e5', 'secret').embed(['a', 'b']);
+      assert.deepEqual(res.vectors, [
         [0.1, 0.2],
         [0.3, 0.4],
       ]);
+      assert.deepEqual(res.usage, {
+        provider: 'openai',
+        model: 'e5',
+        inputTexts: 2,
+        inputChars: 2,
+        promptTokens: 12,
+      });
       assert.equal(seen.length, 1);
       assert.equal(seen[0]?.url, '/v1/embeddings');
       assert.deepEqual(JSON.parse(seen[0]?.body ?? ''), { model: 'e5', input: ['a', 'b'] });
@@ -176,7 +184,15 @@ describe('OpenAIEmbeddings', () => {
     try {
       const provider = new OpenAIEmbeddings(`http://127.0.0.1:${stub.port}/v1`);
       assert.equal(await provider.probe(), true);
-      assert.deepEqual(await provider.embed(['a']), [[1]]);
+      const res = await provider.embed(['a']);
+      assert.deepEqual(res.vectors, [[1]]);
+      assert.deepEqual(res.usage, {
+        provider: 'openai',
+        model: 'nomic-embed-text',
+        inputTexts: 1,
+        inputChars: 1,
+      });
+      assert.equal(res.usage.promptTokens, undefined);
     } finally {
       stub.server.close();
     }

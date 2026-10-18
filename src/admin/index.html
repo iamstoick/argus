@@ -335,15 +335,20 @@ async function loadTelemetry() {
   if (!project) return;
   try {
     const data = await api("/api/projects/" + encodeURIComponent(project) + "/queries?limit=20");
-    const s = data.stats || { total: 0, byTool: {}, avgLatencyMs: 0, totalChars: 0, degraded: 0, errors: 0 };
+    const s = data.stats || { total: 0, byTool: {}, avgLatencyMs: 0, totalChars: 0, estTokens: 0, degraded: 0, errors: 0 };
     const tools = Object.entries(s.byTool || {}).map(([k, v]) => k + "×" + v).join(", ");
     $("telemetrySummary").textContent =
-      s.total + " call(s) · avg " + s.avgLatencyMs + " ms · " + s.totalChars + " chars" +
+      s.total + " call(s) · avg " + s.avgLatencyMs + " ms · " + s.totalChars + " chars (~" + s.estTokens + " tokens est.)" +
       (s.degraded ? " · " + s.degraded + " degraded" : "") + (s.errors ? " · " + s.errors + " error(s)" : "") +
       (tools ? " · " + tools : "");
+    const emb = data.embeddingUsage || [];
+    const embHtml = emb.length === 0 ? "" : "<p class=\"mono\">Embeddings: " + emb.map((r) => {
+      const measured = r.reportedCalls > 0 ? r.promptTokens + " tokens measured" : "~" + r.estTokens + " tokens est.";
+      return esc(r.operation) + " " + esc(r.provider) + "/" + esc(r.model) + ": " + r.calls + " call(s), " + r.texts + " texts, " + measured;
+    }).join(" · ") + "</p>";
     const rows = data.queries || [];
     if (rows.length === 0) {
-      $("telemetry").innerHTML = "<p>No MCP tool calls recorded yet.</p>";
+      $("telemetry").innerHTML = embHtml + "<p>No MCP tool calls recorded yet.</p>";
       return;
     }
     let html = '<table><thead><tr><th>Time (UTC)</th><th>Tool</th><th>Mode</th><th>Results</th><th>Chars</th><th>Latency</th><th>Tiers</th></tr></thead><tbody>';
@@ -357,7 +362,7 @@ async function loadTelemetry() {
         "<td>" + esc(q.chars) + "</td><td class=\"mono\">" + esc(q.latencyMs) + " ms</td>" +
         "<td class=\"mono\">" + esc(tiers) + esc(flags) + "</td></tr>";
     }
-    $("telemetry").innerHTML = html + "</tbody></table>";
+    $("telemetry").innerHTML = embHtml + html + "</tbody></table>";
   } catch (e) {
     $("telemetry").innerHTML = "<p>Telemetry unavailable: " + esc(e.message) + "</p>";
   }

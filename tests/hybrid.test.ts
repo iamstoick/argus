@@ -199,9 +199,15 @@ function stubProvider(calls: string[][]): EmbeddingProvider {
     name: 'stub',
     embed: (texts: string[]) => {
       calls.push(texts);
-      return Promise.resolve(
-        texts.map((t) => (t.includes('SEMANTIC_PROBE') ? [1, 0] : [0, 1])),
-      );
+      return Promise.resolve({
+        vectors: texts.map((t) => (t.includes('SEMANTIC_PROBE') ? [1, 0] : [0, 1])),
+        usage: {
+          provider: 'stub',
+          model: 'stub-m',
+          inputTexts: texts.length,
+          inputChars: texts.reduce((sum, t) => sum + t.length, 0),
+        },
+      });
     },
   };
 }
@@ -232,7 +238,11 @@ describe('semantic cascade', () => {
       db.replaceVectors([{ symbolId: retry.id, dim: 2, vec: [1, 0] }]);
       const wrongDim: EmbeddingProvider = {
         name: 'wrong-dim',
-        embed: (texts: string[]) => Promise.resolve(texts.map(() => [1, 0, 0])),
+        embed: (texts: string[]) =>
+          Promise.resolve({
+            vectors: texts.map(() => [1, 0, 0]),
+            usage: { provider: 'wrong-dim', model: 'm', inputTexts: texts.length, inputChars: 0 },
+          }),
       };
       const out = await lookupDictionaryHybrid(db, { query: 'SEMANTIC_PROBE zzzqqq' }, wrongDim);
       assert.match(out, /Safe to create/);
@@ -298,7 +308,7 @@ describe('OllamaEmbeddings', () => {
     try {
       ({ server, port } = await startStub((body, url) => {
         seen.push({ url, body });
-        return { status: 200, json: { embeddings: [[0.1, 0.2], [0.3, 0.4]] } };
+        return { status: 200, json: { embeddings: [[0.1, 0.2], [0.3, 0.4]], prompt_eval_count: 8 } };
       }));
     } catch (err) {
       if (isBindBlocked(err)) {
@@ -309,8 +319,15 @@ describe('OllamaEmbeddings', () => {
     }
     try {
       const provider = new OllamaEmbeddings(`http://127.0.0.1:${port}/`, 'embed-model');
-      const vecs = await provider.embed(['a', 'b']);
-      assert.deepEqual(vecs, [[0.1, 0.2], [0.3, 0.4]]);
+      const res = await provider.embed(['a', 'b']);
+      assert.deepEqual(res.vectors, [[0.1, 0.2], [0.3, 0.4]]);
+      assert.deepEqual(res.usage, {
+        provider: 'ollama',
+        model: 'embed-model',
+        inputTexts: 2,
+        inputChars: 2,
+        promptTokens: 8,
+      });
       assert.equal(seen.length, 1);
       assert.equal(seen[0]?.url, '/api/embed');
       assert.deepEqual(JSON.parse(seen[0]?.body ?? ''), { model: 'embed-model', input: ['a', 'b'] });
@@ -367,6 +384,13 @@ describe('OllamaEmbeddings', () => {
       const second = await syncSymbolVectors(db, stubProvider(calls));
       assert.equal(second.embedded, 0);
       assert.equal(calls.length, callsBefore); // no HTTP when nothing is missing
+      const usage = db.embeddingUsageStats();
+      assert.equal(usage.length, 1);
+      assert.equal(usage[0]?.operation, 'sync');
+      assert.equal(usage[0]?.provider, 'stub');
+      assert.equal(usage[0]?.texts, db.countSymbols());
+      assert.equal(usage[0]?.reportedCalls, 0);
+      assert.ok((usage[0]?.estTokens ?? 0) > 0);
     }),
   );
 
@@ -391,7 +415,11 @@ describe('OllamaEmbeddings', () => {
       db.replaceVectors([{ symbolId: alpha.id, dim: 2, vec: [1, 0] }]);
       const dim3: EmbeddingProvider = {
         name: 'dim3',
-        embed: (texts: string[]) => Promise.resolve(texts.map(() => [1, 0, 0])),
+        embed: (texts: string[]) =>
+          Promise.resolve({
+            vectors: texts.map(() => [1, 0, 0]),
+            usage: { provider: 'dim3', model: 'm', inputTexts: texts.length, inputChars: 0 },
+          }),
       };
       const stats = await syncSymbolVectors(db, dim3);
       assert.equal(stats.cleared, 1);

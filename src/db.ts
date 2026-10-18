@@ -2,6 +2,7 @@
 import { createHash } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { LIMITS, type RelationshipType, type SymbolKind } from './config.js';
+import type { EmbeddingUsage } from './embeddings.js';
 
 export interface FileRow {
   id: number;
@@ -111,6 +112,17 @@ CREATE TABLE IF NOT EXISTS vector_index (
   dim INTEGER NOT NULL,
   payload TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS embedding_usage (
+  operation TEXT NOT NULL,
+  provider TEXT NOT NULL,
+  model TEXT NOT NULL,
+  calls INTEGER NOT NULL DEFAULT 0,
+  texts INTEGER NOT NULL DEFAULT 0,
+  chars INTEGER NOT NULL DEFAULT 0,
+  prompt_tokens INTEGER NOT NULL DEFAULT 0,
+  reported_calls INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (operation, provider, model)
+);
 `;
 
 /**
@@ -207,8 +219,45 @@ export interface QueryStats {
   byTool: Record<string, number>;
   avgLatencyMs: number;
   totalChars: number;
+  /** Display estimate only (chars / 4): Argus never sees the agent's real token counts. */
+  estTokens: number;
   degraded: number;
   errors: number;
+}
+
+export type EmbeddingOperation = 'sync' | 'query';
+
+export interface EmbeddingUsageRow {
+  operation: EmbeddingOperation;
+  provider: string;
+  model: string;
+  calls: number;
+  texts: number;
+  chars: number;
+  /** Sum of server-reported input tokens (0 when no call reported any). */
+  promptTokens: number;
+  /** Calls whose server reported a token count. */
+  reportedCalls: number;
+  /** Display estimate only (chars / 4), for calls without reported counts. */
+  estTokens: number;
+}
+
+function toEmbeddingUsageRow(value: unknown): EmbeddingUsageRow {
+  if (!isRecord(value)) throw new Error('DB row: expected record');
+  const operation = reqString(value, 'operation');
+  if (operation !== 'sync' && operation !== 'query') throw new Error('DB row: bad embedding operation');
+  const chars = reqNumber(value, 'chars');
+  return {
+    operation,
+    provider: reqString(value, 'provider'),
+    model: reqString(value, 'model'),
+    calls: reqNumber(value, 'calls'),
+    texts: reqNumber(value, 'texts'),
+    chars,
+    promptTokens: reqNumber(value, 'prompt_tokens'),
+    reportedCalls: reqNumber(value, 'reported_calls'),
+    estTokens: Math.round(chars / LIMITS.charsPerToken),
+  };
 }
 
 /** Content fingerprint of one symbol; row ids churn on re-parse, so drift keys on path+kind+name. */
@@ -754,9 +803,45 @@ export class ArgusDb {
       byTool,
       avgLatencyMs: total === 0 ? 0 : Math.round((latencySum / total) * 10) / 10,
       totalChars,
+      estTokens: Math.round(totalChars / LIMITS.charsPerToken),
       degraded,
       errors,
     };
+  }
+
+  /** Accumulate one embed call's usage into the per-operation/provider/model counters. */
+  addEmbeddingUsage(operation: EmbeddingOperation, usage: EmbeddingUsage): void {
+    this.db
+      .prepare(
+        `INSERT INTO embedding_usage (operation, provider, model, calls, texts, chars, prompt_tokens, reported_calls)
+         VALUES (?, ?, ?, 1, ?, ?, ?, ?)
+         ON CONFLICT(operation, provider, model) DO UPDATE SET
+           calls = calls + 1,
+           texts = texts + excluded.texts,
+           chars = chars + excluded.chars,
+           prompt_tokens = prompt_tokens + excluded.prompt_tokens,
+           reported_calls = reported_calls + excluded.reported_calls`,
+      )
+      .run(
+        operation,
+        usage.provider,
+        usage.model,
+        Math.max(0, Math.floor(usage.inputTexts)),
+        Math.max(0, Math.floor(usage.inputChars)),
+        usage.promptTokens ?? 0,
+        usage.promptTokens === undefined ? 0 : 1,
+      );
+  }
+
+  /** Cumulative embedding spend, one row per operation/provider/model. */
+  embeddingUsageStats(): EmbeddingUsageRow[] {
+    return this.db
+      .prepare(
+        `SELECT operation, provider, model, calls, texts, chars, prompt_tokens, reported_calls
+         FROM embedding_usage ORDER BY operation, provider, model`,
+      )
+      .all()
+      .map(toEmbeddingUsageRow);
   }
 
   /** Capture a structural snapshot of the current index; returns the new id. */

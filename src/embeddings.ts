@@ -5,11 +5,42 @@ import { ArgusDb, type SymbolRow } from './db.js';
 /** Texts per /api/embed call; Ollama accepts arrays, batches bound memory. */
 const EMBED_BATCH = 64;
 
+/** What one embed call consumed. Token counts are exact when the server reports them. */
+export interface EmbeddingUsage {
+  provider: string;
+  model: string;
+  inputTexts: number;
+  inputChars: number;
+  /** Server-reported input tokens (OpenAI `usage`, Ollama `prompt_eval_count`); else undefined. */
+  promptTokens?: number | undefined;
+}
+
+export interface EmbedResult {
+  /** One vector per input, order-preserving. */
+  vectors: number[][];
+  usage: EmbeddingUsage;
+}
+
 /** Any vector source the semantic tier can use (Ollama today, others later). */
 export interface EmbeddingProvider {
   readonly name: string;
-  /** One vector per input, order-preserving. */
-  embed(texts: string[]): Promise<number[][]>;
+  embed(texts: string[]): Promise<EmbedResult>;
+}
+
+function baseUsage(provider: string, model: string, texts: string[]): EmbeddingUsage {
+  return {
+    provider,
+    model,
+    inputTexts: texts.length,
+    inputChars: texts.reduce((sum, t) => sum + t.length, 0),
+  };
+}
+
+/** Optional non-negative integer field (server-reported usage); undefined when absent/invalid. */
+function optTokenCount(value: unknown, key: string): number | undefined {
+  if (typeof value !== 'object' || value === null) return undefined;
+  const n = (value as Record<string, unknown>)[key];
+  return typeof n === 'number' && Number.isInteger(n) && n >= 0 ? n : undefined;
 }
 
 function isEmbedResponse(value: unknown): value is { embeddings: number[][] } {
@@ -52,8 +83,9 @@ export class OllamaEmbeddings implements EmbeddingProvider {
     }
   }
 
-  async embed(texts: string[]): Promise<number[][]> {
-    if (texts.length === 0) return [];
+  async embed(texts: string[]): Promise<EmbedResult> {
+    const usage = baseUsage(this.name, this.model, texts);
+    if (texts.length === 0) return { vectors: [], usage };
     let res: Response;
     try {
       res = await fetch(`${this.baseUrl}/api/embed`, {
@@ -75,7 +107,9 @@ export class OllamaEmbeddings implements EmbeddingProvider {
     if (!isEmbedResponse(parsed) || parsed.embeddings.length !== texts.length) {
       throw new Error('ollama embed failed: malformed embeddings response');
     }
-    return parsed.embeddings;
+    const promptTokens = optTokenCount(parsed, 'prompt_eval_count');
+    if (promptTokens !== undefined) usage.promptTokens = promptTokens;
+    return { vectors: parsed.embeddings, usage };
   }
 }
 
@@ -149,8 +183,9 @@ export class OpenAIEmbeddings implements EmbeddingProvider {
     }
   }
 
-  async embed(texts: string[]): Promise<number[][]> {
-    if (texts.length === 0) return [];
+  async embed(texts: string[]): Promise<EmbedResult> {
+    const usage = baseUsage(this.name, this.model, texts);
+    if (texts.length === 0) return { vectors: [], usage };
     let res: Response;
     try {
       res = await fetch(`${this.baseUrl}/embeddings`, {
@@ -172,12 +207,16 @@ export class OpenAIEmbeddings implements EmbeddingProvider {
     if (!isEmbeddingsData(parsed) || parsed.data.length !== texts.length) {
       throw new Error('openai embed failed: malformed embeddings response');
     }
-    return [...parsed.data]
+    const vectors = [...parsed.data]
       .sort((a, b) => a.index - b.index)
       .map((row) => {
         if (row.embedding.length === 0) throw new Error('openai embed failed: empty embedding vector');
         return row.embedding;
       });
+    const usageBlock = (parsed as { usage?: unknown }).usage;
+    const promptTokens = optTokenCount(usageBlock, 'prompt_tokens') ?? optTokenCount(usageBlock, 'total_tokens');
+    if (promptTokens !== undefined) usage.promptTokens = promptTokens;
+    return { vectors, usage };
   }
 }
 
@@ -226,22 +265,25 @@ export async function syncSymbolVectors(
     db.allSymbols().filter((s) => inScope(s) && !have.has(s.id));
   const first = missing(new Set(db.symbolVectors().map((v) => v.symbolId)))[0];
   if (first === undefined) return { embedded: 0, cleared: 0 };
-  const [probe] = await provider.embed([symbolEmbedText(first)]);
+  const probeRes = await provider.embed([symbolEmbedText(first)]);
+  const probe = probeRes.vectors[0];
   if (probe === undefined || probe.length === 0) throw new Error(`${provider.name}: empty embedding`);
   db.replaceVectors([{ symbolId: first.id, dim: probe.length, vec: probe }]);
+  db.addEmbeddingUsage('sync', probeRes.usage);
   const cleared = db.clearVectorDimsExcept(probe.length);
   const rest = missing(new Set(db.symbolVectors().map((v) => v.symbolId)));
   let embedded = 1;
   for (let i = 0; i < rest.length; i += EMBED_BATCH) {
     const batch = rest.slice(i, i + EMBED_BATCH);
-    const vecs = await provider.embed(batch.map(symbolEmbedText));
+    const res = await provider.embed(batch.map(symbolEmbedText));
     db.replaceVectors(
       batch.map((s, j) => {
-        const vec = vecs[j];
+        const vec = res.vectors[j];
         if (vec === undefined || vec.length === 0) throw new Error(`${provider.name}: short embedding batch`);
         return { symbolId: s.id, dim: vec.length, vec };
       }),
     );
+    db.addEmbeddingUsage('sync', res.usage);
     embedded += batch.length;
   }
   return { embedded, cleared };

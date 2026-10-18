@@ -124,8 +124,14 @@ async function semanticMatches(
   exclude: ReadonlySet<number>,
   index?: VectorIndex | undefined,
 ): Promise<SymbolRow[]> {
-  const [qvec] = await provider.embed([query]);
+  const res = await provider.embed([query]);
+  const qvec = res.vectors[0];
   if (qvec === undefined || qvec.length === 0) return [];
+  try {
+    db.addEmbeddingUsage('query', res.usage);
+  } catch {
+    // Best effort: usage accounting must not break the query path.
+  }
   const approx = index?.search(qvec, limit, exclude);
   if (approx !== undefined) {
     const out: SymbolRow[] = [];

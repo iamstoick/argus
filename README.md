@@ -68,7 +68,7 @@ file watcher, background vector sync, audit worker).
 ```bash
 npm install
 npm run build   # tsc -> dist/, plus the admin page and hook template
-npm test        # 133 tests (live-socket/watcher tests skip where the sandbox blocks them)
+npm test        # 135 tests (live-socket/watcher tests skip where the sandbox blocks them)
 ```
 
 `npm run build` compiles `src/` and `tests/` to `dist/`, copies the admin page
@@ -588,8 +588,10 @@ selectors.
 ```bash
 curl -H "Authorization: Bearer $ARGUS_TOKEN" \
   "http://127.0.0.1:3000/api/projects/web/queries?limit=20"
-# { "stats": { "total", "byTool", "avgLatencyMs", "totalChars", "degraded", "errors" },
-#   "queries": [{ "id", "ts", "tool", "mode", "results", "chars", "tiers", "latencyMs", ... }] }
+# { "stats": { "total", "byTool", "avgLatencyMs", "totalChars", "estTokens", "degraded", "errors" },
+#   "queries": [{ "id", "ts", "tool", "mode", "results", "chars", "tiers", "latencyMs", ... }],
+#   "embeddingUsage": [{ "operation", "provider", "model", "calls", "texts", "chars",
+#                        "promptTokens", "reportedCalls", "estTokens" }] }
 
 sqlite3 /srv/web/.mcp-codebase.db \
   "SELECT ts, tool, mode, results, chars, latency_ms FROM query_log ORDER BY id DESC LIMIT 20;"
@@ -597,6 +599,26 @@ sqlite3 /srv/web/.mcp-codebase.db \
 
 Empty? Agents haven't called any tools yet — telemetry reflects MCP usage,
 not UI browsing.
+
+### Token consumption
+
+Two different numbers, both available:
+
+- **Tokens served to agents (estimated).** `stats.estTokens` is `totalChars /
+  4` — the standard heuristic. It estimates what the agent's model must read,
+  not a meter reading: Argus makes zero LLM calls and never sees the agent's
+  real token counts. Shown in the admin panel as `~N tokens (est.)`.
+- **Embedding spend (measured where possible).** Every embed call accumulates
+  into per-operation (`sync` vs `query`) / provider / model counters: calls,
+  texts, chars, plus `promptTokens` summed from server-reported counts
+  (OpenAI's `usage`, Ollama's `prompt_eval_count`). `reportedCalls` tells you
+  how many calls actually reported a count; `estTokens` (chars/4) covers the
+  rest. Cumulative (never pruned — one small row per combination):
+
+```bash
+sqlite3 /srv/web/.mcp-codebase.db \
+  "SELECT operation, provider, model, calls, texts, prompt_tokens, reported_calls FROM embedding_usage;"
+```
 
 ### Structural snapshots
 
@@ -663,7 +685,7 @@ observe-only except snapshot capture — it never edits your code.
 | `GET /api/projects/<n>/blast` | `name` (required), `limit` | `{ matched, outgoing, incoming, incomingTruncated }` |
 | `GET /api/projects/<n>/duplicates` | `limit` | `{ groups, truncated }` |
 | `GET /api/projects/<n>/dead-code` | `limit`, `include_exported=true` | `{ symbols, truncated }` |
-| `GET /api/projects/<n>/queries` | `limit` | `{ stats, queries }` (see [Observe & evolve](#observe--evolve)) |
+| `GET /api/projects/<n>/queries` | `limit` | `{ stats, queries, embeddingUsage }` (see [Observe & evolve](#observe--evolve)) |
 | `GET /api/projects/<n>/snapshots` | `limit` | `{ snapshots: […] }`, newest first |
 | `GET /api/projects/<n>/snapshots` | `from`, `to`, `limit` | diff object (`added`/`removed`/`changed`, counts, `truncated`) |
 | `GET /api/projects/<n>/snapshots` | `take=1` | `{ snapshot, previousId, diff }` (`diff` null when it's the first) |
@@ -724,9 +746,10 @@ Gitignore all three:
 **Tables** (all queries parameterized; open with any SQLite client):
 `files` (path → content hash), `symbols` + `symbols_fts` (lexical index),
 `symbol_relationships`, `symbol_vectors` + `vector_index` (semantic tier +
-persisted HNSW graph), `query_log` (telemetry, 1000 rows), `snapshots`
-(drift history, 20 kept), `audit_reports` (10 per kind). Vectors dominate
-size (`dim × 8 bytes` per symbol plus the HNSW graph).
+persisted HNSW graph), `query_log` (telemetry, 1000 rows), `embedding_usage`
+(cumulative embedding counters), `snapshots` (drift history, 20 kept),
+`audit_reports` (10 per kind). Vectors dominate size (`dim × 8 bytes` per
+symbol plus the HNSW graph).
 
 **Sharing / backup:** stop the server, copy all three sidecars together (a
 live `-wal` copied alone is inconsistent), drop them at the recipient's

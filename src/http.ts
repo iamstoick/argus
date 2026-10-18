@@ -224,7 +224,11 @@ export function createRequestHandler(
     }
     if (action === 'queries') {
       const limit = clampLimit(Number(url.searchParams.get('limit') ?? Number.NaN));
-      sendJson(res, 200, { stats: entry.db.queryStats(), queries: entry.db.recentQueries(limit) });
+      sendJson(res, 200, {
+        stats: entry.db.queryStats(),
+        queries: entry.db.recentQueries(limit),
+        embeddingUsage: entry.db.embeddingUsageStats(),
+      });
       return;
     }
     if (action === 'snapshots') {

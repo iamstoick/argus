@@ -84,6 +84,8 @@ export const LIMITS = {
   maxSnapshots: 20,
   /** Retained audit reports per kind per project (oldest pruned on store). */
   maxAuditReports: 10,
+  /** Display-only heuristic for token estimates (chars per token). */
+  charsPerToken: 4,
 } as const;
 
 /** Symbol kinds. The plan names function/class/method/interface/struct; the
