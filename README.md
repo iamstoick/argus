@@ -135,8 +135,9 @@ existing files may contain `//` or `/* */` comments (VS Code ships them) —
 those parse fine, but the merged file is rewritten as plain JSON, so comments
 are lost on the first merge; servers never are.
 
-Clients with **global-only** configs (Windsurf, Codex) can't be project-wired
-by `init` — see [Client setup](#client-setup) for manual snippets.
+Clients with **global-only** configs (Muse, Windsurf, Codex) can't be
+project-wired by `init` — see [Client setup](#client-setup) for manual
+snippets.
 
 ## Run
 
@@ -362,6 +363,26 @@ project-level MCP config, so `init` doesn't write it; merge this by hand):
 command = "node"
 args = ["/path/to/argus/dist/src/index.js", "--root", "/path/to/project"]
 ```
+
+**Muse** (user-global `~/.config/muse/settings.json`, `$XDG_CONFIG_HOME`
+honored — Muse reads MCP servers only from this one file, so merge by hand
+rather than via `init`):
+
+```json
+{
+  "schema_version": 1,
+  "mcpServers": {
+    "argus": {
+      "command": "node",
+      "args": ["/path/to/argus/dist/src/index.js", "--root", "/path/to/project"]
+    }
+  }
+}
+```
+
+Keep `"schema_version": 1` (a settings file without it fails every command).
+For `serve` mode instead of stdio, use a `streamable-http` entry with the
+`/mcp` URL and bearer header, as in the remote-agents example above.
 
 **The `project` parameter.** Every tool accepts an optional `project` name.
 Single-project servers default to their only project; multi-project servers
