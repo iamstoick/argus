@@ -68,7 +68,7 @@ file watcher, background vector sync, audit worker).
 ```bash
 npm install
 npm run build   # tsc -> dist/, plus the admin page and hook template
-npm test        # 127 tests (live-socket/watcher tests skip where the sandbox blocks them)
+npm test        # 133 tests (live-socket/watcher tests skip where the sandbox blocks them)
 ```
 
 `npm run build` compiles `src/` and `tests/` to `dist/`, copies the admin page
@@ -91,17 +91,33 @@ That is the whole happy path for solo local use. Read on for teams
 
 ## Project setup (`argus init`)
 
-`argus init --root <path>` (defaults to the current directory) writes four
-things into the project. It never touches your source files:
+`argus init --root <path>` (defaults to the current directory) wires the
+project for one or more AI clients. It never touches your source files:
 
 | File | What it does |
 |---|---|
-| `.mcp.json` | MCP client entry: runs `node <argus>/dist/src/index.js --root <project>` over stdio. Merged: other servers in an existing file are preserved. |
-| `AGENTS.md` | Appends the index-first rule (created if missing, never duplicated). |
+| MCP config (per `--client`, see below) | Client entry: runs `node <argus>/dist/src/index.js --root <project>` over stdio. Merged: other servers in an existing file are preserved. |
+| `AGENTS.md` | Appends the index-first rule (created if missing, never duplicated). Read by virtually every coding agent — this part is client-agnostic. |
 | `.claude/hooks/check-index-first.py` | Claude Code hook: reminds the agent to query the index when creating new code files. Installed executable. |
 | `.claude/settings.json` | Wires the hook as a `PreToolUse` matcher on `Write`. Merged: unrelated hooks are preserved; stale argus entries are refreshed. |
 
-Flags:
+`--client <name>` selects the MCP config files to write (repeatable or
+comma-separated; default `claude`):
+
+| `--client` | File written | Format |
+|---|---|---|
+| `claude` | `.mcp.json` | `{ "mcpServers": { "argus": { "command", "args" } } }` |
+| `cursor` | `.cursor/mcp.json` | Same `mcpServers` shape as Claude |
+| `vscode` | `.vscode/mcp.json` | `{ "servers": { "argus": { "type": "stdio", "command", "args" } } }` (VS Code uses `servers`, not `mcpServers`) |
+| `all` | all three | — |
+
+```bash
+argus init --root /path/to/project --client all
+argus init --root /path/to/project --client cursor,vscode
+```
+
+The hook is Claude Code-specific, so it installs only when `claude` is among
+the selected clients (otherwise that step reports `skipped`). Other flags:
 
 | Flag | Effect |
 |---|---|
@@ -112,12 +128,15 @@ Flags:
 
 `init` is idempotent: run it again any time; second runs report `unchanged`
 everywhere. It prints one `created/updated/unchanged/skipped: <file> — <detail>`
-line per file, and fails loudly (missing root, invalid JSON without `--force`,
-missing hook template) instead of half-writing. It needs no engine or index:
-it works before the first sync.
+line per file, and fails loudly (missing root, unknown `--client`, invalid
+JSON without `--force`, missing hook template) instead of half-writing. It
+needs no engine or index: it works before the first sync. Two merge notes:
+existing files may contain `//` or `/* */` comments (VS Code ships them) —
+those parse fine, but the merged file is rewritten as plain JSON, so comments
+are lost on the first merge; servers never are.
 
-Prefer manual setup? Copy the `.mcp.json` shape from [Client setup](#client-setup),
-the rule from [Agent rule](#agent-rule), and the hook files from `examples/`.
+Clients with **global-only** configs (Windsurf, Codex) can't be project-wired
+by `init` — see [Client setup](#client-setup) for manual snippets.
 
 ## Run
 
@@ -262,10 +281,10 @@ holding the old `Authorization` header must be updated to match.
 
 ## Client setup
 
-`argus init` writes the stdio entry for you; this section is the manual
-equivalent plus remote-client entries. Always use **absolute paths**. After
-changing entries, restart the client (or reload its MCP config) and confirm
-the `argus` tools are listed.
+`argus init --client all` writes the project-local entries for you; this
+section is the manual equivalent, plus remote-client and global-config
+clients. Always use **absolute paths**. After changing entries, restart the
+client (or reload its MCP config) and confirm the `argus` tools are listed.
 
 **Claude Code** (`~/.claude.json` or project `.mcp.json`):
 
@@ -281,6 +300,24 @@ the `argus` tools are listed.
 ```
 
 or via CLI: `claude mcp add argus -- node /path/to/argus/dist/src/index.js --root /path/to/project`
+
+**Cursor** (project `.cursor/mcp.json`, or global `~/.cursor/mcp.json`):
+same `mcpServers` shape as Claude Code above.
+
+**VS Code** (workspace `.vscode/mcp.json`): note the `servers` key (not
+`mcpServers`) and the required `"type": "stdio"`:
+
+```json
+{
+  "servers": {
+    "argus": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["/path/to/argus/dist/src/index.js", "--root", "/path/to/project"]
+    }
+  }
+}
+```
 
 **Remote agents against `serve` mode** — Streamable HTTP entry (Muse
 `~/.config/muse/settings.json`, or any MCP client with HTTP support):
@@ -303,8 +340,28 @@ Paste the **literal** token into `headers`. Most clients do *not* expand
 401s, and some clients misreport that as "requires OAuth sign-in"
 (`mcp login` cannot fix a static-token server; fix the token/URL instead).
 
-**Cursor / Windsurf** (`.cursor/mcp.json` or equivalent): same stdio shape as
-Claude Code above.
+**Windsurf** (global `~/.codeium/windsurf/mcp_config.json` — Windsurf has no
+project-level MCP config, so `init` doesn't write it; merge this by hand):
+
+```json
+{
+  "mcpServers": {
+    "argus": {
+      "command": "node",
+      "args": ["/path/to/argus/dist/src/index.js", "--root", "/path/to/project"]
+    }
+  }
+}
+```
+
+**Codex** (user-level `~/.codex/config.toml` TOML — likewise global, so not
+`init`-managed; `codex mcp add` also works):
+
+```toml
+[mcp_servers.argus]
+command = "node"
+args = ["/path/to/argus/dist/src/index.js", "--root", "/path/to/project"]
+```
 
 **The `project` parameter.** Every tool accepts an optional `project` name.
 Single-project servers default to their only project; multi-project servers
@@ -622,6 +679,7 @@ name — typos exit loudly instead of silently misconfiguring.
 | `--embeddings-key <secret>` | `ARGUS_EMBEDDINGS_KEY` | none | all | API key (openai only; omit locally) |
 | `--no-semantic` | `ARGUS_OLLAMA=off` | on (probed) | all | Disable the semantic tier entirely |
 | `--audit-interval <secs>` | `ARGUS_AUDIT_INTERVAL` | 300 (serve), 0 (stdio) | all | Background audit cadence; `0` disables |
+| `--client <name>` | — | `claude` | init | `claude`, `cursor`, `vscode`, or `all` (repeatable/comma-separated) |
 | `--force` | — | off | init | Overwrite managed entries / invalid JSON |
 | `--no-agents-md` | — | off | init | Skip `AGENTS.md` |
 | `--no-hooks` | — | off | init | Skip the hook install |

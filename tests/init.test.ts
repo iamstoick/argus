@@ -1,10 +1,18 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { AGENTS_RULE, HOOK_FILENAME, defaultHooksSourceDir, runInit } from '../src/init.js';
+import {
+  AGENTS_RULE,
+  HOOK_FILENAME,
+  defaultHooksSourceDir,
+  parseClientList,
+  runInit,
+  stripJsonComments,
+  type ClientName,
+} from '../src/init.js';
 
 function runHook(script: string, input: string): Promise<{ code: number; stdout: string }> {
   return new Promise((resolve, reject) => {
@@ -197,6 +205,107 @@ describe('runInit', () => {
       assert.match(readFileSync(dest, 'utf8'), /lookup_dictionary/);
     } finally {
       rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('parseClientList', () => {
+  it('defaults to Claude Code and parses all flag forms', () => {
+    assert.deepEqual(parseClientList([]), ['claude']);
+    assert.deepEqual(parseClientList(['--root', '.']), ['claude']);
+    assert.deepEqual(parseClientList(['--client', 'cursor']), ['cursor']);
+    assert.deepEqual(parseClientList(['--client=vscode']), ['vscode']);
+    assert.deepEqual(parseClientList(['--client', 'cursor,vscode']), ['cursor', 'vscode']);
+    assert.deepEqual(parseClientList(['--client', 'cursor', '--client=vscode']), ['cursor', 'vscode']);
+    assert.deepEqual(parseClientList(['--client', 'cursor,cursor']), ['cursor']);
+    assert.deepEqual(parseClientList(['--client', 'all']), ['claude', 'cursor', 'vscode']);
+    assert.deepEqual(parseClientList(['--client', 'vscode', '--client', 'all']), ['claude', 'cursor', 'vscode']);
+  });
+
+  it('ignores empty values and bare flags, throws on unknown names', () => {
+    assert.deepEqual(parseClientList(['--client=']), ['claude']);
+    assert.deepEqual(parseClientList(['--client', '--force']), ['claude']);
+    assert.deepEqual(parseClientList(['--client', ' ,cursor, ']), ['cursor']);
+    assert.throws(() => parseClientList(['--client', 'windsurf']), /unknown --client 'windsurf'/);
+    assert.throws(() => parseClientList(['--client=Claude']), /unknown --client/);
+  });
+});
+
+describe('stripJsonComments', () => {
+  it('strips line and block comments but keeps strings intact', () => {
+    const text = '{\n// leading comment\n"a": 1, /* inline */ "url": "http://x//y", "b": "/*not*/", "c": "q\\"//q"\n}';
+    const parsed = JSON.parse(stripJsonComments(text)) as Record<string, unknown>;
+    assert.deepEqual(parsed, { a: 1, url: 'http://x//y', b: '/*not*/', c: 'q"//q' });
+    assert.equal(stripJsonComments('{"a":1}'), '{"a":1}');
+  });
+});
+
+describe('runInit clients', () => {
+  function clientsRoot(): { root: string; hooksSourceDir: string } {
+    const root = makeRoot();
+    const hooksSourceDir = makeHookSource();
+    return { root, hooksSourceDir };
+  }
+
+  it('writes per-client configs with native shapes', () => {
+    const { root, hooksSourceDir } = clientsRoot();
+    try {
+      const clients: ClientName[] = ['cursor', 'vscode'];
+      const actions = runInit({ root, entrypoint: '/x/index.js', hooksSourceDir, clients });
+      assert.equal(existsSync(join(root, '.mcp.json')), false);
+      const cursor = JSON.parse(readFileSync(join(root, '.cursor/mcp.json'), 'utf8')) as {
+        mcpServers: { argus: { command: string; args: string[] } };
+      };
+      assert.deepEqual(cursor.mcpServers.argus, { command: 'node', args: ['/x/index.js', '--root', root] });
+      const vscode = JSON.parse(readFileSync(join(root, '.vscode/mcp.json'), 'utf8')) as {
+        servers: { argus: { type: string; command: string; args: string[] } };
+      };
+      assert.deepEqual(vscode.servers.argus, {
+        type: 'stdio',
+        command: 'node',
+        args: ['/x/index.js', '--root', root],
+      });
+      assert.equal(actions.find((a) => a.file.endsWith(join('.claude', 'hooks')))?.action, 'skipped');
+      assert.equal(existsSync(join(root, 'AGENTS.md')), true);
+      // Idempotent rerun.
+      const second = runInit({ root, entrypoint: '/x/index.js', hooksSourceDir, clients });
+      assert.ok(second.every((a) => a.action === 'unchanged' || a.action === 'skipped'));
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+      rmSync(hooksSourceDir, { recursive: true, force: true });
+    }
+  });
+
+  it('merges into commented VS Code files without losing servers', () => {
+    const { root, hooksSourceDir } = clientsRoot();
+    try {
+      mkdirSync(join(root, '.vscode'), { recursive: true });
+      writeFileSync(
+        join(root, '.vscode/mcp.json'),
+        '{\n  // Managed section below\n  "servers": {\n    /* keep me */ "other": { "type": "stdio", "command": "x" }\n  }\n}\n',
+      );
+      const actions = runInit({ root, entrypoint: '/x/index.js', hooksSourceDir, clients: ['vscode'] });
+      assert.equal(actions.find((a) => a.file.endsWith('mcp.json'))?.action, 'updated');
+      const merged = JSON.parse(readFileSync(join(root, '.vscode/mcp.json'), 'utf8')) as {
+        servers: Record<string, unknown>;
+      };
+      assert.ok(merged.servers['other'] !== undefined && merged.servers['argus'] !== undefined);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+      rmSync(hooksSourceDir, { recursive: true, force: true });
+    }
+  });
+
+  it('installs hooks only when Claude is selected', () => {
+    const { root, hooksSourceDir } = clientsRoot();
+    try {
+      runInit({ root, entrypoint: '/x/index.js', hooksSourceDir, clients: ['vscode'] });
+      assert.equal(existsSync(join(root, '.claude')), false);
+      runInit({ root, entrypoint: '/x/index.js', hooksSourceDir, clients: ['vscode', 'claude'] });
+      assert.equal(existsSync(join(root, '.claude', 'hooks', HOOK_FILENAME)), true);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+      rmSync(hooksSourceDir, { recursive: true, force: true });
     }
   });
 });

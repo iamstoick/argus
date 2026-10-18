@@ -15,7 +15,7 @@ import {
 } from './config.js';
 import { OllamaEmbeddings, OpenAIEmbeddings, type EmbeddingProvider } from './embeddings.js';
 import { runHttp, type HttpHandle } from './http.js';
-import { runInit } from './init.js';
+import { parseClientList, runInit } from './init.js';
 import { IndexManager } from './projects.js';
 import { ParserEngine } from './parser.js';
 import { runStdio } from './server.js';
@@ -76,6 +76,7 @@ async function main(): Promise<void> {
       force: hasFlag(rest, 'force'),
       agentsMd: !hasFlag(rest, 'no-agents-md'),
       hooks: !hasFlag(rest, 'no-hooks'),
+      clients: parseClientList(rest),
     });
     for (const a of actions) console.log(`${a.action}: ${a.file} — ${a.detail}`);
     return;
