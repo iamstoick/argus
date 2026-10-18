@@ -7,7 +7,7 @@
     "argus": "./dist/src/index.js"
   },
   "scripts": {
-    "build": "tsc && mkdir -p dist/src/admin && cp src/admin/index.html dist/src/admin/index.html",
+    "build": "tsc && mkdir -p dist/src/admin dist/examples && cp src/admin/index.html dist/src/admin/index.html && cp examples/check-index-first.py examples/claude-hooks.json dist/examples/",
     "start": "node dist/src/index.js",
     "dev": "node --experimental-strip-types src/index.ts",
     "test": "npm run build && node --test dist/tests/*.test.js",

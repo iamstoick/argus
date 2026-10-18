@@ -4,12 +4,22 @@ import { readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { HELP_TEXT, defaultProjectName, hasFlag, parseServeArgs } from './cli.js';
-import { parseConfigFile, resolveOllama, resolveRoot, resolveToken, type ProjectSpec } from './config.js';
-import { OllamaEmbeddings, type EmbeddingProvider } from './embeddings.js';
+import {
+  DEFAULT_AUDIT_INTERVAL_SECS,
+  parseConfigFile,
+  resolveAuditInterval,
+  resolveEmbeddings,
+  resolveRoot,
+  resolveToken,
+  type ProjectSpec,
+} from './config.js';
+import { OllamaEmbeddings, OpenAIEmbeddings, type EmbeddingProvider } from './embeddings.js';
 import { runHttp, type HttpHandle } from './http.js';
+import { runInit } from './init.js';
 import { IndexManager } from './projects.js';
 import { ParserEngine } from './parser.js';
 import { runStdio } from './server.js';
+import { startAuditWorker, type AuditWorkerHandle } from './worker.js';
 
 function version(): string {
   try {
@@ -36,16 +46,19 @@ function loadSpecs(args: { configPath: string | undefined; root: string | undefi
   throw new Error('serve mode needs --config <file> or --root <path>');
 }
 
-/** Probe the Ollama sidecar; undefined keeps exact + lexical tiers only. Never fatal. */
+/** Probe the embeddings sidecar; undefined keeps exact + lexical tiers only. Never fatal. */
 async function probeEmbeddings(argv: string[]): Promise<EmbeddingProvider | undefined> {
-  const config = resolveOllama(argv, process.env);
+  const config = resolveEmbeddings(argv, process.env);
   if (config === undefined) return undefined;
-  const provider = new OllamaEmbeddings(config.url, config.model, 2000);
+  const provider: OllamaEmbeddings | OpenAIEmbeddings =
+    config.provider === 'openai'
+      ? new OpenAIEmbeddings(config.url, config.model, config.apiKey, 2000)
+      : new OllamaEmbeddings(config.url, config.model, 2000);
   if (await provider.probe()) {
-    console.error(`[argus] semantic search: ollama ${config.model} at ${config.url}`);
+    console.error(`[argus] semantic search: ${provider.name} ${config.model} at ${config.url}`);
     return provider;
   }
-  console.error(`[argus] semantic search off (no ollama at ${config.url}; exact + lexical only)`);
+  console.error(`[argus] semantic search off (no ${provider.name} at ${config.url}; exact + lexical only)`);
   return undefined;
 }
 
@@ -53,6 +66,18 @@ async function main(): Promise<void> {
   const argv = process.argv.slice(2);
   if (argv.includes('--help') || argv.includes('-h')) {
     console.log(HELP_TEXT);
+    return;
+  }
+  if (argv[0] === 'init') {
+    const rest = argv.slice(1);
+    const actions = runInit({
+      root: resolve(resolveRoot(rest, process.env)),
+      entrypoint: fileURLToPath(import.meta.url),
+      force: hasFlag(rest, 'force'),
+      agentsMd: !hasFlag(rest, 'no-agents-md'),
+      hooks: !hasFlag(rest, 'no-hooks'),
+    });
+    for (const a of actions) console.log(`${a.action}: ${a.file} — ${a.detail}`);
     return;
   }
   const serveMode = argv[0] === 'serve';
@@ -103,6 +128,12 @@ async function main(): Promise<void> {
   if (serveMode) {
     http = await runHttp(manager, { host, port, token, version: version() });
   }
+  const auditSecs = resolveAuditInterval(argv, process.env, serveMode ? DEFAULT_AUDIT_INTERVAL_SECS : 0);
+  let audit: AuditWorkerHandle | undefined;
+  if (auditSecs > 0) {
+    audit = startAuditWorker(manager, auditSecs * 1000, (msg) => console.error(`[argus] ${msg}`));
+    console.error(`[argus] audit worker every ${auditSecs}s (dead-code + duplicates)`);
+  }
   if (withStdio) {
     await runStdio(manager, version());
   }
@@ -110,6 +141,7 @@ async function main(): Promise<void> {
   const shutdown = (): void => {
     void (async () => {
       try {
+        audit?.stop();
         await http?.close();
       } finally {
         await manager.close();

@@ -5,12 +5,14 @@ import { z } from 'zod';
 import type { IndexManager, ProjectEntry } from './projects.js';
 import {
   checkBlastRadius,
+  diffSnapshots,
   findDeadCode,
   findDuplicates,
   getCodebaseMap,
   getSymbolDetails,
   lookupDictionary,
   lookupDictionaryHybrid,
+  type HybridStats,
 } from './tools.js';
 
 type TextResult = { content: Array<{ type: 'text'; text: string }> };
@@ -19,18 +21,55 @@ function toolResult(text: string): TextResult {
   return { content: [{ type: 'text', text }] };
 }
 
+/** Extra telemetry detail a tool handler may attach (mode + hybrid tier counts). */
+export interface TelemetryContext {
+  mode?: string | undefined;
+  stats?: HybridStats | undefined;
+}
+
+/** Best-effort telemetry: logging failures never break tool calls. */
+function logTelemetry(
+  entry: ProjectEntry,
+  toolName: string,
+  tc: TelemetryContext,
+  text: string,
+  latencyMs: number,
+  error: boolean,
+): void {
+  try {
+    const s = tc.stats;
+    entry.db.logQuery({
+      tool: toolName,
+      mode: tc.mode,
+      results: s === undefined ? undefined : s.exact + s.lexical + s.semantic,
+      tiers: s === undefined ? undefined : { exact: s.exact, lexical: s.lexical, semantic: s.semantic },
+      chars: text.length,
+      latencyMs,
+      degraded: s?.degraded ?? false,
+      error,
+    });
+  } catch {
+    // Telemetry is observability, not the request path; swallow and serve.
+  }
+}
+
 /** Resolve the project selector, then run the handler with failures as text. */
 function withProject(
   manager: IndexManager,
   toolName: string,
   project: string | undefined,
   fn: (entry: ProjectEntry) => string,
+  tc: TelemetryContext = {},
 ): TextResult {
   const resolved = manager.resolve(project);
   if ('error' in resolved) return toolResult(resolved.error);
+  const start = Date.now();
   try {
-    return toolResult(fn(resolved.entry));
+    const text = fn(resolved.entry);
+    logTelemetry(resolved.entry, toolName, tc, text, Date.now() - start, false);
+    return toolResult(text);
   } catch (err) {
+    logTelemetry(resolved.entry, toolName, tc, '', Date.now() - start, true);
     return toolResult(`${toolName} failed: ${err instanceof Error ? err.message : String(err)}`);
   }
 }
@@ -41,12 +80,17 @@ async function withProjectAsync(
   toolName: string,
   project: string | undefined,
   fn: (entry: ProjectEntry) => Promise<string>,
+  tc: TelemetryContext = {},
 ): Promise<TextResult> {
   const resolved = manager.resolve(project);
   if ('error' in resolved) return toolResult(resolved.error);
+  const start = Date.now();
   try {
-    return toolResult(await fn(resolved.entry));
+    const text = await fn(resolved.entry);
+    logTelemetry(resolved.entry, toolName, tc, text, Date.now() - start, false);
+    return toolResult(text);
   } catch (err) {
+    logTelemetry(resolved.entry, toolName, tc, '', Date.now() - start, true);
     return toolResult(`${toolName} failed: ${err instanceof Error ? err.message : String(err)}`);
   }
 }
@@ -76,12 +120,19 @@ export function createMcpServer(manager: IndexManager, version: string): McpServ
     },
     (args) => {
       if (args.mode === 'hybrid') {
-        return withProjectAsync(manager, 'lookup_dictionary', args.project, (entry) =>
-          lookupDictionaryHybrid(entry.db, args, entry.embeddings),
+        const stats: HybridStats = { exact: 0, lexical: 0, semantic: 0, degraded: false };
+        return withProjectAsync(
+          manager,
+          'lookup_dictionary',
+          args.project,
+          (entry) => lookupDictionaryHybrid(entry.db, args, entry.embeddings, stats, entry.vectorIndex),
+          { mode: 'hybrid', stats },
         );
       }
       return Promise.resolve(
-        withProject(manager, 'lookup_dictionary', args.project, (entry) => lookupDictionary(entry.db, args)),
+        withProject(manager, 'lookup_dictionary', args.project, (entry) => lookupDictionary(entry.db, args), {
+          mode: 'exact',
+        }),
       );
     },
   );
@@ -164,6 +215,33 @@ export function createMcpServer(manager: IndexManager, version: string): McpServ
     (args) =>
       Promise.resolve(
         withProject(manager, 'find_dead_code', args.project, (entry) => findDeadCode(entry.db, args)),
+      ),
+  );
+
+  server.registerTool(
+    'diff_snapshots',
+    {
+      description:
+        'Structural drift: symbols added, removed, or signature-changed between two index snapshots (defaults: previous to latest).',
+      inputSchema: {
+        from: z.number().optional().describe('Older snapshot id (default: previous)'),
+        to: z.number().optional().describe('Newer snapshot id (default: latest)'),
+        take: z.boolean().optional().describe('Capture a fresh snapshot first, then diff against the previous one'),
+        limit: z.number().optional().describe('Max entries per section (default 50)'),
+        project: projectField,
+      },
+    },
+    (args) =>
+      Promise.resolve(
+        withProject(manager, 'diff_snapshots', args.project, (entry) => {
+          if (args.take === true) {
+            const prev = entry.db.latestSnapshot();
+            const id = entry.db.takeSnapshot();
+            if (prev === undefined) return `Captured baseline snapshot #${id}. Make changes, then diff again.`;
+            return `Captured snapshot #${id}.\n${diffSnapshots(entry.db, { from: prev.id, to: id, limit: args.limit })}`;
+          }
+          return diffSnapshots(entry.db, args);
+        }),
       ),
   );
 

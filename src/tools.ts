@@ -2,9 +2,10 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { SYMBOL_KINDS, clampLimit, truncateOutput } from './config.js';
-import { ArgusDb, type RelationRow, type SymbolRow } from './db.js';
+import { ArgusDb, type RelationRow, type SymbolFingerprint, type SymbolRow } from './db.js';
 import { cosineSimilarity, type EmbeddingProvider } from './embeddings.js';
 import { simpleName } from './parser.js';
+import type { VectorIndex } from './vectorIndex.js';
 
 export interface LookupArgs {
   query: string;
@@ -29,6 +30,14 @@ export function lookupDictionary(db: ArgusDb, args: LookupArgs): string {
   return truncateOutput(out);
 }
 
+/** Per-tier match counts for telemetry; filled on every return path when provided. */
+export interface HybridStats {
+  exact: number;
+  lexical: number;
+  semantic: number;
+  degraded: boolean;
+}
+
 /**
  * Hybrid cascade: exact substring matches first, then lexical-similar
  * (FTS5 tokens + typo tolerance), then semantic-similar when a provider is
@@ -38,7 +47,15 @@ export async function lookupDictionaryHybrid(
   db: ArgusDb,
   args: LookupArgs,
   embeddings?: EmbeddingProvider | undefined,
+  stats?: HybridStats | undefined,
+  index?: VectorIndex | undefined,
 ): Promise<string> {
+  if (stats !== undefined) {
+    stats.exact = 0;
+    stats.lexical = 0;
+    stats.semantic = 0;
+    stats.degraded = false;
+  }
   const query = args.query.trim();
   if (query === '') return 'Empty query: pass a symbol name fragment to search for.';
   if (args.kind !== undefined && !SYMBOL_KINDS.has(args.kind)) {
@@ -53,10 +70,16 @@ export async function lookupDictionaryHybrid(
   let degraded = false;
   if (embeddings !== undefined) {
     try {
-      semantic = await semanticMatches(db, embeddings, query, args.kind, limit + 1, seen);
+      semantic = await semanticMatches(db, embeddings, query, args.kind, limit + 1, seen, index);
     } catch {
       degraded = true;
     }
+  }
+  if (stats !== undefined) {
+    stats.exact = exact.length;
+    stats.lexical = lexical.length;
+    stats.semantic = semantic.length;
+    stats.degraded = degraded;
   }
   const similarCount = lexical.length + semantic.length;
   if (exact.length === 0 && similarCount === 0) {
@@ -99,9 +122,21 @@ async function semanticMatches(
   kind: string | undefined,
   limit: number,
   exclude: ReadonlySet<number>,
+  index?: VectorIndex | undefined,
 ): Promise<SymbolRow[]> {
   const [qvec] = await provider.embed([query]);
   if (qvec === undefined || qvec.length === 0) return [];
+  const approx = index?.search(qvec, limit, exclude);
+  if (approx !== undefined) {
+    const out: SymbolRow[] = [];
+    for (const id of approx) {
+      const row = db.symbolById(id);
+      if (row === undefined) continue;
+      if (kind !== undefined && row.kind !== kind) continue;
+      out.push(row);
+    }
+    return out;
+  }
   const scored: Array<{ id: number; sim: number }> = [];
   for (const v of db.symbolVectors()) {
     if (v.dim !== qvec.length || exclude.has(v.symbolId)) continue;
@@ -417,4 +452,128 @@ function formatSymbolLine(r: SymbolRow): string {
   const doc = r.docstring !== null && r.docstring !== '' ? ` — ${r.docstring}` : '';
   const exp = r.is_exported === 1 ? ' ✓exported' : '';
   return `- #${r.id} ${r.name} [${r.kind}]${exp} ${r.path}:${r.start_line}\n  ${r.signature}${doc}`;
+}
+
+export interface SnapshotDiffData {
+  fromId: number;
+  toId: number;
+  fromTakenAt: string;
+  toTakenAt: string;
+  countsBefore: { files: number; symbols: number; relationships: number };
+  countsAfter: { files: number; symbols: number; relationships: number };
+  added: SymbolFingerprint[];
+  removed: SymbolFingerprint[];
+  changed: SymbolFingerprint[];
+  truncated: boolean;
+}
+
+function fingerprintKey(f: SymbolFingerprint): string {
+  return `${f.path}|${f.kind}|${f.name}`;
+}
+
+function compareFingerprints(a: SymbolFingerprint, b: SymbolFingerprint): number {
+  return a.path < b.path ? -1 : a.path > b.path ? 1 : a.name < b.name ? -1 : 1;
+}
+
+/**
+ * Structural drift between two snapshots (defaults: previous -> latest).
+ * Shared by the MCP tool and the admin JSON API.
+ */
+export function snapshotDiffData(
+  db: ArgusDb,
+  fromId: number | undefined,
+  toId: number | undefined,
+  rawLimit: number | undefined,
+): SnapshotDiffData | { error: string } {
+  for (const id of [fromId, toId]) {
+    if (id !== undefined && (!Number.isInteger(id) || id <= 0)) return { error: `Invalid snapshot id ${String(id)}.` };
+  }
+  const latest = db.latestSnapshot();
+  if (latest === undefined) return { error: 'No snapshots yet. Capture one, make changes, then capture another.' };
+  const to = toId ?? latest.id;
+  let from = fromId;
+  if (from === undefined) {
+    const ordered = db.listSnapshots(200).map((s) => s.id).sort((a, b) => a - b);
+    const toIdx = ordered.indexOf(to);
+    if (toIdx < 0) return { error: `Unknown snapshot id ${to}.` };
+    if (toIdx === 0) return { error: `Snapshot #${to} is the oldest retained; nothing earlier to diff against.` };
+    from = ordered[toIdx - 1] as number;
+  }
+  if (from === to) {
+    const same = db.listSnapshots(200).find((s) => s.id === from);
+    if (same === undefined) return { error: `Unknown snapshot id ${from}.` };
+    return {
+      fromId: from,
+      toId: to,
+      fromTakenAt: same.takenAt,
+      toTakenAt: same.takenAt,
+      countsBefore: { files: same.files, symbols: same.symbols, relationships: same.relationships },
+      countsAfter: { files: same.files, symbols: same.symbols, relationships: same.relationships },
+      added: [],
+      removed: [],
+      changed: [],
+      truncated: false,
+    };
+  }
+  const before = db.snapshotFingerprints(from);
+  if (before === undefined) return { error: `Unknown snapshot id ${from}.` };
+  const after = db.snapshotFingerprints(to);
+  if (after === undefined) return { error: `Unknown snapshot id ${to}.` };
+  const summaries = new Map(db.listSnapshots(200).map((s) => [s.id, s]));
+  const fromSummary = summaries.get(from);
+  const toSummary = summaries.get(to);
+  if (fromSummary === undefined || toSummary === undefined) return { error: 'Snapshot row vanished mid-diff.' };
+  const beforeByKey = new Map(before.map((f) => [fingerprintKey(f), f]));
+  const afterByKey = new Map(after.map((f) => [fingerprintKey(f), f]));
+  const added = after.filter((f) => !beforeByKey.has(fingerprintKey(f))).sort(compareFingerprints);
+  const removed = before.filter((f) => !afterByKey.has(fingerprintKey(f))).sort(compareFingerprints);
+  const changed = after
+    .filter((f) => {
+      const old = beforeByKey.get(fingerprintKey(f));
+      return old !== undefined && old.sig !== f.sig;
+    })
+    .sort(compareFingerprints);
+  const limit = clampLimit(rawLimit);
+  return {
+    fromId: from,
+    toId: to,
+    fromTakenAt: fromSummary.takenAt,
+    toTakenAt: toSummary.takenAt,
+    countsBefore: { files: fromSummary.files, symbols: fromSummary.symbols, relationships: fromSummary.relationships },
+    countsAfter: { files: toSummary.files, symbols: toSummary.symbols, relationships: toSummary.relationships },
+    added: added.slice(0, limit),
+    removed: removed.slice(0, limit),
+    changed: changed.slice(0, limit),
+    truncated: added.length > limit || removed.length > limit || changed.length > limit,
+  };
+}
+
+export interface DiffSnapshotsArgs {
+  from?: number | undefined;
+  to?: number | undefined;
+  limit?: number | undefined;
+}
+
+export function diffSnapshots(db: ArgusDb, args: DiffSnapshotsArgs): string {
+  const data = snapshotDiffData(db, args.from, args.to, args.limit);
+  if ('error' in data) return data.error;
+  const lines: string[] = [
+    `Structural diff #${data.fromId} (${data.fromTakenAt}) → #${data.toId} (${data.toTakenAt}):`,
+    `  files/symbols/relationships: ${data.countsBefore.files}/${data.countsBefore.symbols}/${data.countsBefore.relationships} → ${data.countsAfter.files}/${data.countsAfter.symbols}/${data.countsAfter.relationships}`,
+  ];
+  const sections: Array<[string, string, SymbolFingerprint[]]> = [
+    ['Added', '+', data.added],
+    ['Removed', '-', data.removed],
+    ['Changed signatures', '~', data.changed],
+  ];
+  let total = 0;
+  for (const [label, mark, rows] of sections) {
+    if (rows.length === 0) continue;
+    total += rows.length;
+    lines.push(`${label} (${rows.length}):`);
+    for (const f of rows) lines.push(`  ${mark} ${f.path} [${f.kind}] ${f.name}`);
+  }
+  if (total === 0) lines.push('No structural changes.');
+  if (data.truncated) lines.push('…more entries exist; raise the limit.');
+  return truncateOutput(lines.join('\n'));
 }

@@ -1,6 +1,7 @@
 /** SQLite storage layer (node:sqlite, embedded). All queries parameterized. */
+import { createHash } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
-import type { RelationshipType, SymbolKind } from './config.js';
+import { LIMITS, type RelationshipType, type SymbolKind } from './config.js';
 
 export interface FileRow {
   id: number;
@@ -77,6 +78,39 @@ CREATE TABLE IF NOT EXISTS symbol_vectors (
   vec BLOB NOT NULL,
   FOREIGN KEY(symbol_id) REFERENCES symbols(id) ON DELETE CASCADE
 );
+CREATE TABLE IF NOT EXISTS query_log (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  tool TEXT NOT NULL,
+  mode TEXT,
+  results INTEGER,
+  chars INTEGER NOT NULL,
+  tiers TEXT,
+  latency_ms INTEGER NOT NULL,
+  degraded INTEGER NOT NULL DEFAULT 0,
+  error INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_query_log_id ON query_log(id);
+CREATE TABLE IF NOT EXISTS snapshots (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  taken_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  files INTEGER NOT NULL,
+  symbols INTEGER NOT NULL,
+  relationships INTEGER NOT NULL,
+  payload TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS audit_reports (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  taken_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  kind TEXT NOT NULL,
+  payload TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_audit_reports_kind ON audit_reports(kind);
+CREATE TABLE IF NOT EXISTS vector_index (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  dim INTEGER NOT NULL,
+  payload TEXT NOT NULL
+);
 `;
 
 /**
@@ -142,6 +176,122 @@ export interface SymbolVector {
   symbolId: number;
   dim: number;
   vec: number[];
+}
+
+export interface QueryLogEntry {
+  tool: string;
+  mode?: string | undefined;
+  results?: number | undefined;
+  chars: number;
+  tiers?: Record<string, number> | undefined;
+  latencyMs: number;
+  degraded?: boolean | undefined;
+  error?: boolean | undefined;
+}
+
+export interface QueryLogRow {
+  id: number;
+  ts: string;
+  tool: string;
+  mode: string | null;
+  results: number | null;
+  chars: number;
+  tiers: Record<string, number> | null;
+  latencyMs: number;
+  degraded: boolean;
+  error: boolean;
+}
+
+export interface QueryStats {
+  total: number;
+  byTool: Record<string, number>;
+  avgLatencyMs: number;
+  totalChars: number;
+  degraded: number;
+  errors: number;
+}
+
+/** Content fingerprint of one symbol; row ids churn on re-parse, so drift keys on path+kind+name. */
+export interface SymbolFingerprint {
+  path: string;
+  kind: string;
+  name: string;
+  /** 12 hex chars of sha256(signature). */
+  sig: string;
+}
+
+export interface SnapshotSummary {
+  id: number;
+  takenAt: string;
+  files: number;
+  symbols: number;
+  relationships: number;
+}
+
+export interface AuditReport {
+  kind: string;
+  takenAt: string;
+  payload: unknown;
+}
+
+function toAuditReport(value: unknown): AuditReport {
+  if (!isRecord(value)) throw new Error('DB row: expected record');
+  return { kind: reqString(value, 'kind'), takenAt: reqString(value, 'taken_at'), payload: JSON.parse(reqString(value, 'payload')) as unknown };
+}
+
+function toSnapshotSummary(value: unknown): SnapshotSummary {
+  if (!isRecord(value)) throw new Error('DB row: expected record');
+  return {
+    id: reqNumber(value, 'id'),
+    takenAt: reqString(value, 'taken_at'),
+    files: reqNumber(value, 'files'),
+    symbols: reqNumber(value, 'symbols'),
+    relationships: reqNumber(value, 'relationships'),
+  };
+}
+
+function parseFingerprints(payload: string): SymbolFingerprint[] {
+  const parsed = JSON.parse(payload) as unknown;
+  if (!Array.isArray(parsed)) throw new Error('DB row: malformed snapshot payload');
+  return parsed.map((item) => {
+    if (!isRecord(item)) throw new Error('DB row: malformed snapshot payload');
+    return {
+      path: reqString(item, 'path'),
+      kind: reqString(item, 'kind'),
+      name: reqString(item, 'name'),
+      sig: reqString(item, 'sig'),
+    };
+  });
+}
+
+function toQueryLogRow(value: unknown): QueryLogRow {
+  if (!isRecord(value)) throw new Error('DB row: expected record');
+  const mode = value['mode'];
+  const results = value['results'];
+  const tiersRaw = value['tiers'];
+  let tiers: Record<string, number> | null = null;
+  if (typeof tiersRaw === 'string') {
+    try {
+      const parsed = JSON.parse(tiersRaw) as unknown;
+      if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
+        tiers = parsed as Record<string, number>;
+      }
+    } catch {
+      tiers = null;
+    }
+  }
+  return {
+    id: reqNumber(value, 'id'),
+    ts: reqString(value, 'ts'),
+    tool: reqString(value, 'tool'),
+    mode: typeof mode === 'string' ? mode : null,
+    results: typeof results === 'number' ? results : null,
+    chars: reqNumber(value, 'chars'),
+    tiers,
+    latencyMs: reqNumber(value, 'latency_ms'),
+    degraded: reqNumber(value, 'degraded') !== 0,
+    error: reqNumber(value, 'error') !== 0,
+  };
 }
 
 export interface RelationRow {
@@ -499,6 +649,38 @@ export class ArgusDb {
     return this.db.prepare('SELECT symbol_id, dim, vec FROM symbol_vectors').all().map(toSymbolVector);
   }
 
+  vectorById(id: number): SymbolVector | undefined {
+    const row = this.db.prepare('SELECT symbol_id, dim, vec FROM symbol_vectors WHERE symbol_id = ?').get(id);
+    return row === undefined ? undefined : toSymbolVector(row);
+  }
+
+  vectorIds(): number[] {
+    const out: number[] = [];
+    for (const row of this.db.prepare('SELECT symbol_id AS id FROM symbol_vectors').all()) {
+      if (!isRecord(row)) throw new Error('DB row: expected record');
+      out.push(reqNumber(row, 'id'));
+    }
+    return out;
+  }
+
+  getVectorIndex(): { dim: number; payload: string } | undefined {
+    const row = this.db.prepare('SELECT dim, payload FROM vector_index WHERE id = 1').get();
+    if (row === undefined || !isRecord(row)) return undefined;
+    return { dim: reqNumber(row, 'dim'), payload: reqString(row, 'payload') };
+  }
+
+  setVectorIndex(dim: number, payload: string): void {
+    this.db
+      .prepare(
+        'INSERT INTO vector_index (id, dim, payload) VALUES (1, ?, ?) ON CONFLICT(id) DO UPDATE SET dim = excluded.dim, payload = excluded.payload',
+      )
+      .run(dim, payload);
+  }
+
+  clearVectorIndex(): void {
+    this.db.prepare('DELETE FROM vector_index WHERE id = 1').run();
+  }
+
   countVectors(): number {
     return this.count('SELECT COUNT(*) AS n FROM symbol_vectors');
   }
@@ -507,6 +689,146 @@ export class ArgusDb {
   clearVectorDimsExcept(dim: number): number {
     const r = this.db.prepare('DELETE FROM symbol_vectors WHERE dim != ?').run(dim);
     return Number(r.changes ?? 0);
+  }
+
+  /** Record one MCP tool call; best-effort callers treat failures as non-fatal. */
+  logQuery(entry: QueryLogEntry): void {
+    this.db
+      .prepare(
+        `INSERT INTO query_log (tool, mode, results, chars, tiers, latency_ms, degraded, error)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        entry.tool,
+        entry.mode ?? null,
+        entry.results ?? null,
+        Math.max(0, Math.floor(entry.chars)),
+        entry.tiers === undefined ? null : JSON.stringify(entry.tiers),
+        Math.max(0, Math.floor(entry.latencyMs)),
+        entry.degraded === true ? 1 : 0,
+        entry.error === true ? 1 : 0,
+      );
+    this.pruneQueryLog(LIMITS.maxQueryLogRows);
+  }
+
+  /** Keep only the newest maxRows telemetry rows; returns rows removed. */
+  pruneQueryLog(maxRows: number): number {
+    if (maxRows < 1) return 0;
+    const r = this.db
+      .prepare('DELETE FROM query_log WHERE id NOT IN (SELECT id FROM query_log ORDER BY id DESC LIMIT ?)')
+      .run(maxRows);
+    return Number(r.changes ?? 0);
+  }
+
+  /** Newest telemetry rows first. */
+  recentQueries(limit: number): QueryLogRow[] {
+    return this.db
+      .prepare(
+        'SELECT id, ts, tool, mode, results, chars, tiers, latency_ms, degraded, error FROM query_log ORDER BY id DESC LIMIT ?',
+      )
+      .all(Math.max(0, Math.floor(limit)))
+      .map(toQueryLogRow);
+  }
+
+  queryStats(): QueryStats {
+    const byTool: Record<string, number> = {};
+    let total = 0;
+    let latencySum = 0;
+    let totalChars = 0;
+    let degraded = 0;
+    let errors = 0;
+    for (const row of this.db
+      .prepare('SELECT tool, latency_ms, chars, degraded, error FROM query_log')
+      .all()) {
+      if (!isRecord(row)) throw new Error('DB row: expected record');
+      const tool = reqString(row, 'tool');
+      byTool[tool] = (byTool[tool] ?? 0) + 1;
+      total += 1;
+      latencySum += reqNumber(row, 'latency_ms');
+      totalChars += reqNumber(row, 'chars');
+      if (reqNumber(row, 'degraded') !== 0) degraded += 1;
+      if (reqNumber(row, 'error') !== 0) errors += 1;
+    }
+    return {
+      total,
+      byTool,
+      avgLatencyMs: total === 0 ? 0 : Math.round((latencySum / total) * 10) / 10,
+      totalChars,
+      degraded,
+      errors,
+    };
+  }
+
+  /** Capture a structural snapshot of the current index; returns the new id. */
+  takeSnapshot(): number {
+    const prints: SymbolFingerprint[] = this.allSymbols().map((s) => ({
+      path: s.path ?? '(unknown)',
+      kind: s.kind,
+      name: s.name,
+      sig: createHash('sha256').update(s.signature, 'utf8').digest('hex').slice(0, 12),
+    }));
+    prints.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : a.name < b.name ? -1 : 1));
+    const r = this.db
+      .prepare('INSERT INTO snapshots (files, symbols, relationships, payload) VALUES (?, ?, ?, ?)')
+      .run(this.countFiles(), this.countSymbols(), this.countRelationships(), JSON.stringify(prints));
+    const lastId = r.lastInsertRowid;
+    if (typeof lastId !== 'number') throw new Error('DB: missing lastInsertRowid');
+    this.db
+      .prepare('DELETE FROM snapshots WHERE id NOT IN (SELECT id FROM snapshots ORDER BY id DESC LIMIT ?)')
+      .run(LIMITS.maxSnapshots);
+    return lastId;
+  }
+
+  /** Newest snapshot summaries first. */
+  listSnapshots(limit: number): SnapshotSummary[] {
+    return this.db
+      .prepare(
+        'SELECT id, taken_at, files, symbols, relationships FROM snapshots ORDER BY id DESC LIMIT ?',
+      )
+      .all(Math.max(0, Math.floor(limit)))
+      .map(toSnapshotSummary);
+  }
+
+  latestSnapshot(): SnapshotSummary | undefined {
+    return this.listSnapshots(1)[0];
+  }
+
+  /** Fingerprints for one snapshot, or undefined when the id is unknown. */
+  snapshotFingerprints(id: number): SymbolFingerprint[] | undefined {
+    const row = this.db.prepare('SELECT payload FROM snapshots WHERE id = ?').get(id);
+    if (row === undefined || !isRecord(row)) return undefined;
+    return parseFingerprints(reqString(row, 'payload'));
+  }
+
+  /** Store one background-audit report; keeps the newest MAX_AUDIT_REPORTS per kind. */
+  storeAuditReport(kind: string, payload: unknown): void {
+    this.db.prepare('INSERT INTO audit_reports (kind, payload) VALUES (?, ?)').run(kind, JSON.stringify(payload));
+    this.db
+      .prepare(
+        `DELETE FROM audit_reports WHERE kind = ? AND id NOT IN
+         (SELECT id FROM audit_reports WHERE kind = ? ORDER BY id DESC LIMIT ?)`,
+      )
+      .run(kind, kind, LIMITS.maxAuditReports);
+  }
+
+  /** Latest report per kind, newest first. */
+  latestAuditReports(): AuditReport[] {
+    return this.db
+      .prepare(
+        `SELECT kind, taken_at, payload FROM audit_reports
+         WHERE id IN (SELECT MAX(id) FROM audit_reports GROUP BY kind)
+         ORDER BY taken_at DESC, kind`,
+      )
+      .all()
+      .map(toAuditReport);
+  }
+
+  /** Report history for one kind, newest first. */
+  auditHistory(kind: string, limit: number): AuditReport[] {
+    return this.db
+      .prepare('SELECT kind, taken_at, payload FROM audit_reports WHERE kind = ? ORDER BY id DESC LIMIT ?')
+      .all(kind, Math.max(0, Math.floor(limit)))
+      .map(toAuditReport);
   }
 
   exportedSymbolsByFile(prefix: string | undefined, limit: number): SymbolRow[] {

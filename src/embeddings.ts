@@ -1,5 +1,5 @@
-/** Optional semantic tier: embedding providers (Ollama) + vector maintenance. */
-import { DEFAULT_OLLAMA_MODEL, DEFAULT_OLLAMA_URL } from './config.js';
+/** Optional semantic tier: embedding providers (Ollama, OpenAI-compatible) + vector maintenance. */
+import { DEFAULT_OLLAMA_MODEL, DEFAULT_OLLAMA_URL, DEFAULT_OPENAI_MODEL, DEFAULT_OPENAI_URL } from './config.js';
 import { ArgusDb, type SymbolRow } from './db.js';
 
 /** Texts per /api/embed call; Ollama accepts arrays, batches bound memory. */
@@ -76,6 +76,108 @@ export class OllamaEmbeddings implements EmbeddingProvider {
       throw new Error('ollama embed failed: malformed embeddings response');
     }
     return parsed.embeddings;
+  }
+}
+
+interface OpenAIEmbeddingRow {
+  embedding: number[];
+  index: number;
+}
+
+function isEmbeddingsData(value: unknown): value is { data: OpenAIEmbeddingRow[] } {
+  if (typeof value !== 'object' || value === null) return false;
+  const data = (value as Record<string, unknown>)['data'];
+  if (!Array.isArray(data)) return false;
+  return data.every(
+    (row) =>
+      typeof row === 'object' &&
+      row !== null &&
+      Array.isArray((row as Record<string, unknown>)['embedding']) &&
+      ((row as Record<string, unknown>)['embedding'] as unknown[]).every(
+        (n) => typeof n === 'number' && Number.isFinite(n),
+      ) &&
+      typeof (row as Record<string, unknown>)['index'] === 'number',
+  );
+}
+
+/**
+ * Any OpenAI-compatible embeddings server: OpenAI, vLLM, LM Studio, llama.cpp,
+ * Ollama's /v1. baseUrl is the version root (…/v1); the key is optional since
+ * local servers need none. Failures throw; callers degrade.
+ */
+export class OpenAIEmbeddings implements EmbeddingProvider {
+  readonly name = 'openai';
+  private readonly baseUrl: string;
+  private readonly model: string;
+  private readonly apiKey: string | undefined;
+  private readonly timeoutMs: number;
+
+  constructor(
+    baseUrl: string = DEFAULT_OPENAI_URL,
+    model: string = DEFAULT_OPENAI_MODEL,
+    apiKey: string | undefined = undefined,
+    timeoutMs = 30_000,
+  ) {
+    this.baseUrl = baseUrl.replace(/\/+$/, '');
+    this.model = model;
+    this.apiKey = apiKey;
+    this.timeoutMs = timeoutMs;
+  }
+
+  get url(): string {
+    return this.baseUrl;
+  }
+
+  get modelName(): string {
+    return this.model;
+  }
+
+  private authHeaders(): Record<string, string> {
+    return this.apiKey === undefined ? {} : { authorization: `Bearer ${this.apiKey}` };
+  }
+
+  /** True when a /v1 server answers; never throws. */
+  async probe(): Promise<boolean> {
+    try {
+      const res = await fetch(`${this.baseUrl}/models`, {
+        headers: this.authHeaders(),
+        signal: AbortSignal.timeout(this.timeoutMs),
+      });
+      return res.ok;
+    } catch {
+      return false;
+    }
+  }
+
+  async embed(texts: string[]): Promise<number[][]> {
+    if (texts.length === 0) return [];
+    let res: Response;
+    try {
+      res = await fetch(`${this.baseUrl}/embeddings`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', ...this.authHeaders() },
+        body: JSON.stringify({ model: this.model, input: texts }),
+        signal: AbortSignal.timeout(this.timeoutMs),
+      });
+    } catch (err) {
+      throw new Error(`openai embed failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    if (!res.ok) throw new Error(`openai embed failed: HTTP ${res.status}`);
+    let parsed: unknown;
+    try {
+      parsed = (await res.json()) as unknown;
+    } catch {
+      throw new Error('openai embed failed: invalid JSON response');
+    }
+    if (!isEmbeddingsData(parsed) || parsed.data.length !== texts.length) {
+      throw new Error('openai embed failed: malformed embeddings response');
+    }
+    return [...parsed.data]
+      .sort((a, b) => a.index - b.index)
+      .map((row) => {
+        if (row.embedding.length === 0) throw new Error('openai embed failed: empty embedding vector');
+        return row.embedding;
+      });
   }
 }
 

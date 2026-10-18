@@ -45,6 +45,10 @@ export const DB_FILENAME = '.mcp-codebase.db';
 export const DEFAULT_OLLAMA_URL = 'http://127.0.0.1:11434';
 export const DEFAULT_OLLAMA_MODEL = 'nomic-embed-text';
 
+/** OpenAI-compatible base: Ollama's /v1 answers here, so local default works for both providers. */
+export const DEFAULT_OPENAI_URL = 'http://127.0.0.1:11434/v1';
+export const DEFAULT_OPENAI_MODEL = 'nomic-embed-text';
+
 /** Directory names never indexed. */
 export const IGNORE_DIRS: ReadonlySet<string> = new Set([
   'node_modules',
@@ -74,6 +78,12 @@ export const LIMITS = {
   maxSignatureChars: 500,
   maxDocstringChars: 1000,
   maxOutputChars: 12000,
+  /** Retained query-telemetry rows per project (oldest pruned on insert). */
+  maxQueryLogRows: 1000,
+  /** Retained structural snapshots per project (oldest pruned on capture). */
+  maxSnapshots: 20,
+  /** Retained audit reports per kind per project (oldest pruned on store). */
+  maxAuditReports: 10,
 } as const;
 
 /** Symbol kinds. The plan names function/class/method/interface/struct; the
@@ -171,6 +181,28 @@ export interface OllamaConfig {
   model: string;
 }
 
+/** `--name value` / `--name=value` scan; last occurrence wins, empty values never win. */
+function scanFlag(argv: string[], name: string): string | undefined {
+  let found: string | undefined;
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === undefined) continue;
+    if (arg === `--${name}`) {
+      const next = argv[i + 1];
+      if (next !== undefined && next !== '' && !next.startsWith('--')) found = next;
+    } else if (arg.startsWith(`--${name}=`)) {
+      const value = arg.slice(name.length + 3);
+      if (value !== '') found = value;
+    }
+  }
+  return found;
+}
+
+function nonEmptyEnv(env: NodeJS.ProcessEnv, key: string): string | undefined {
+  const value = env[key];
+  return value !== undefined && value !== '' ? value : undefined;
+}
+
 /**
  * Resolve the optional Ollama sidecar: --ollama[=url] / ARGUS_OLLAMA_URL,
  * --ollama-model[=m] / ARGUS_OLLAMA_MODEL. Auto-probed when enabled, so a
@@ -179,27 +211,59 @@ export interface OllamaConfig {
  */
 export function resolveOllama(argv: string[], env: NodeJS.ProcessEnv): OllamaConfig | undefined {
   if (argv.includes('--no-semantic') || env['ARGUS_OLLAMA'] === 'off') return undefined;
-  let url = env['ARGUS_OLLAMA_URL'] !== '' ? (env['ARGUS_OLLAMA_URL'] ?? DEFAULT_OLLAMA_URL) : DEFAULT_OLLAMA_URL;
-  let model =
-    env['ARGUS_OLLAMA_MODEL'] !== '' ? (env['ARGUS_OLLAMA_MODEL'] ?? DEFAULT_OLLAMA_MODEL) : DEFAULT_OLLAMA_MODEL;
-  for (let i = 0; i < argv.length; i++) {
-    const arg = argv[i];
-    if (arg === undefined) continue;
-    if (arg === '--ollama') {
-      const next = argv[i + 1];
-      if (next !== undefined && next !== '' && !next.startsWith('--')) url = next;
-    } else if (arg.startsWith('--ollama=')) {
-      const value = arg.slice('--ollama='.length);
-      if (value !== '') url = value;
-    } else if (arg === '--ollama-model') {
-      const next = argv[i + 1];
-      if (next !== undefined && next !== '' && !next.startsWith('--')) model = next;
-    } else if (arg.startsWith('--ollama-model=')) {
-      const value = arg.slice('--ollama-model='.length);
-      if (value !== '') model = value;
-    }
+  return {
+    url: scanFlag(argv, 'ollama') ?? nonEmptyEnv(env, 'ARGUS_OLLAMA_URL') ?? DEFAULT_OLLAMA_URL,
+    model: scanFlag(argv, 'ollama-model') ?? nonEmptyEnv(env, 'ARGUS_OLLAMA_MODEL') ?? DEFAULT_OLLAMA_MODEL,
+  };
+}
+
+export type EmbeddingsProviderName = 'ollama' | 'openai';
+
+export interface EmbeddingsConfig {
+  provider: EmbeddingsProviderName;
+  url: string;
+  model: string;
+  apiKey: string | undefined;
+}
+
+/**
+ * Resolve the semantic-tier provider: --embeddings-provider / ARGUS_EMBEDDINGS_PROVIDER
+ * ('ollama' default, 'openai' for any OpenAI-compatible /v1 server). Provider=openai
+ * reads --embeddings-url/model/key (ARGUS_EMBEDDINGS_xxx); provider=ollama keeps the
+ * legacy --ollama and ARGUS_OLLAMA_xxx knobs, with the generic --embeddings-url/model
+ * as fallback. Same off switch as resolveOllama. Unknown provider names throw.
+ */
+export function resolveEmbeddings(argv: string[], env: NodeJS.ProcessEnv): EmbeddingsConfig | undefined {
+  if (argv.includes('--no-semantic') || env['ARGUS_OLLAMA'] === 'off') return undefined;
+  const provider = scanFlag(argv, 'embeddings-provider') ?? nonEmptyEnv(env, 'ARGUS_EMBEDDINGS_PROVIDER') ?? 'ollama';
+  if (provider !== 'ollama' && provider !== 'openai') {
+    throw new Error(`invalid embeddings provider '${provider}' (want ollama|openai)`);
   }
-  return { url, model };
+  if (provider === 'openai') {
+    return {
+      provider,
+      url: scanFlag(argv, 'embeddings-url') ?? nonEmptyEnv(env, 'ARGUS_EMBEDDINGS_URL') ?? DEFAULT_OPENAI_URL,
+      model:
+        scanFlag(argv, 'embeddings-model') ?? nonEmptyEnv(env, 'ARGUS_EMBEDDINGS_MODEL') ?? DEFAULT_OPENAI_MODEL,
+      apiKey: scanFlag(argv, 'embeddings-key') ?? nonEmptyEnv(env, 'ARGUS_EMBEDDINGS_KEY'),
+    };
+  }
+  return {
+    provider,
+    url:
+      scanFlag(argv, 'ollama') ??
+      nonEmptyEnv(env, 'ARGUS_OLLAMA_URL') ??
+      scanFlag(argv, 'embeddings-url') ??
+      nonEmptyEnv(env, 'ARGUS_EMBEDDINGS_URL') ??
+      DEFAULT_OLLAMA_URL,
+    model:
+      scanFlag(argv, 'ollama-model') ??
+      nonEmptyEnv(env, 'ARGUS_OLLAMA_MODEL') ??
+      scanFlag(argv, 'embeddings-model') ??
+      nonEmptyEnv(env, 'ARGUS_EMBEDDINGS_MODEL') ??
+      DEFAULT_OLLAMA_MODEL,
+    apiKey: undefined,
+  };
 }
 
 export function resolveToken(argv: string[], env: NodeJS.ProcessEnv): string | undefined {
@@ -236,6 +300,27 @@ export function resolveRoot(argv: string[], env: NodeJS.ProcessEnv): string {
 export function clampLimit(raw: number | undefined): number {
   if (raw === undefined || !Number.isFinite(raw)) return LIMITS.defaultLimit;
   return Math.min(Math.max(1, Math.floor(raw)), LIMITS.maxLimit);
+}
+
+/** Default audit cadence (seconds) for serve mode; stdio mode defaults to off. */
+export const DEFAULT_AUDIT_INTERVAL_SECS = 300;
+
+/**
+ * Resolve the background-audit cadence: --audit-interval <secs> / ARGUS_AUDIT_INTERVAL.
+ * 0 disables. Unknown/negative values throw.
+ */
+export function resolveAuditInterval(
+  argv: string[],
+  env: NodeJS.ProcessEnv,
+  defaultSecs: number,
+): number {
+  const raw = scanFlag(argv, 'audit-interval') ?? nonEmptyEnv(env, 'ARGUS_AUDIT_INTERVAL');
+  if (raw === undefined) return defaultSecs;
+  const secs = Number(raw);
+  if (!Number.isInteger(secs) || secs < 0) {
+    throw new Error(`invalid --audit-interval '${raw}' (want seconds >= 0, 0 disables)`);
+  }
+  return secs;
 }
 
 /** Collapse whitespace and cap length; keeps tool output token-light. */

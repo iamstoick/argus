@@ -7,6 +7,7 @@ import { ArgusDb } from './db.js';
 import { syncSymbolVectors, type EmbeddingProvider } from './embeddings.js';
 import { syncRoot, watchRoot, type IndexStats } from './indexer.js';
 import type { ParserEngine } from './parser.js';
+import { VectorIndex } from './vectorIndex.js';
 
 export interface ProjectEntry {
   name: string;
@@ -16,6 +17,8 @@ export interface ProjectEntry {
   lastSync: IndexStats | undefined;
   /** Semantic-tier provider, when Ollama (or a substitute) was probed OK. */
   embeddings: EmbeddingProvider | undefined;
+  /** ANN accelerator over stored vectors; queries fall back to brute force until ready. */
+  vectorIndex: VectorIndex;
 }
 
 export interface ManagerOpts {
@@ -55,6 +58,21 @@ export interface ServerHealth {
 export type ProjectResolution =
   | { entry: ProjectEntry }
   | { error: string };
+
+/** Minimum gap between automatic snapshots; rapid saves coalesce into one. */
+export const SNAPSHOT_MIN_INTERVAL_MS = 60_000;
+
+/**
+ * True when no snapshot exists, the latest is older than minIntervalMs, or
+ * its timestamp is unparseable (fail-open: a snapshot is always safe).
+ * takenAt is SQLite UTC "YYYY-MM-DD HH:MM:SS".
+ */
+export function snapshotDue(latestTakenAt: string | null, nowMs: number, minIntervalMs: number): boolean {
+  if (latestTakenAt === null) return true;
+  const takenMs = Date.parse(`${latestTakenAt.replace(' ', 'T')}Z`);
+  if (!Number.isFinite(takenMs)) return true;
+  return nowMs - takenMs >= minIntervalMs;
+}
 
 /**
  * Owns N isolated project indexes. Each project keeps its own SQLite file and
@@ -107,6 +125,7 @@ export class IndexManager {
       watching: false,
       lastSync: undefined,
       embeddings: opts.embeddings,
+      vectorIndex: VectorIndex.empty(),
     };
     try {
       entry.lastSync = syncRoot(db, engine, spec.path);
@@ -116,7 +135,35 @@ export class IndexManager {
         `project '${spec.name}': initial sync failed: ${err instanceof Error ? err.message : String(err)}`,
       );
     }
+    // Baseline snapshot on first open, then one per sync that changed the index.
+    // Never fatal: drift history is observability, like the watcher.
+    try {
+      const stats = entry.lastSync;
+      if (stats.updated > 0 || stats.removed > 0 || db.latestSnapshot() === undefined) {
+        db.takeSnapshot();
+      }
+    } catch (err) {
+      opts.onError(`project '${spec.name}': snapshot failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
     if (opts.watch) {
+      const syncVectorIndex = (): void => {
+        void entry.vectorIndex.sync(db).catch((err: unknown) => {
+          opts.onError(
+            `project '${spec.name}': vector index sync failed: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        });
+      };
+      const snapshotAfterWatchEvent = (outcome: 'updated' | 'unchanged' | 'failed' | 'removed'): void => {
+        if (outcome !== 'updated' && outcome !== 'removed') return;
+        try {
+          if (snapshotDue(db.latestSnapshot()?.takenAt ?? null, Date.now(), SNAPSHOT_MIN_INTERVAL_MS)) {
+            db.takeSnapshot();
+          }
+        } catch (err) {
+          opts.onError(`project '${spec.name}': snapshot failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
+        syncVectorIndex();
+      };
       const handle = watchRoot(
         db,
         engine,
@@ -124,7 +171,13 @@ export class IndexManager {
         (err) => {
           opts.onError(`project '${spec.name}': ${err instanceof Error ? err.message : String(err)}`);
         },
-        { embeddings: opts.embeddings, onVectorSync: opts.onVectorSync, projectName: spec.name },
+        {
+          embeddings: opts.embeddings,
+          onVectorSync: opts.onVectorSync,
+          projectName: spec.name,
+          onVectorsSynced: syncVectorIndex,
+        },
+        snapshotAfterWatchEvent,
       );
       this.watchers.push(handle.watcher);
       entry.watching = true;
@@ -133,7 +186,14 @@ export class IndexManager {
       // Background catch-up: never blocks startup; vectors only add recall.
       const provider = opts.embeddings;
       void syncSymbolVectors(db, provider)
-        .then((stats) => {
+        .then(async (stats) => {
+          try {
+            await entry.vectorIndex.sync(db);
+          } catch (err) {
+            opts.onVectorSync?.(
+              `project '${spec.name}': vector index sync failed: ${err instanceof Error ? err.message : String(err)}`,
+            );
+          }
           opts.onVectorSync?.(
             `project '${spec.name}': semantic index ready (${stats.embedded} embedded, ${stats.cleared} cleared)`,
           );

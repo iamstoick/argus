@@ -147,6 +147,39 @@
       <h2>Symbol details</h2>
       <div id="detail"></div>
     </div>
+    <div class="panel">
+      <h2>Query telemetry</h2>
+      <div class="row">
+        <button id="telemetryRefresh">Refresh</button>
+        <span id="telemetrySummary" class="mono"></span>
+      </div>
+      <div id="telemetry"></div>
+    </div>
+    <div class="panel">
+      <h2>Structural snapshots</h2>
+      <div class="row">
+        <button id="snapRefresh">Refresh</button>
+        <button class="primary" id="snapTake">Snapshot now</button>
+        <span id="snapSummary" class="mono"></span>
+      </div>
+      <div id="snapList"></div>
+      <div class="row" style="margin-top:10px">
+        <label for="snapFrom">From</label>
+        <select id="snapFrom"></select>
+        <label for="snapTo">To</label>
+        <select id="snapTo"></select>
+        <button id="snapDiff">Diff</button>
+      </div>
+      <div id="snapDiffOut"></div>
+    </div>
+    <div class="panel">
+      <h2>Background audits</h2>
+      <div class="row">
+        <button id="auditRefresh">Refresh</button>
+        <span id="auditSummary" class="mono"></span>
+      </div>
+      <div id="audit"></div>
+    </div>
   </section>
 </main>
 <script>
@@ -297,11 +330,159 @@ function refList(rels) {
   return html + "</ul>";
 }
 
-$("connect").addEventListener("click", connect);
-$("project").addEventListener("change", () => { renderStats(); $("results").innerHTML = ""; $("detailWrap").classList.add("hidden"); });
+async function loadTelemetry() {
+  const project = $("project").value;
+  if (!project) return;
+  try {
+    const data = await api("/api/projects/" + encodeURIComponent(project) + "/queries?limit=20");
+    const s = data.stats || { total: 0, byTool: {}, avgLatencyMs: 0, totalChars: 0, degraded: 0, errors: 0 };
+    const tools = Object.entries(s.byTool || {}).map(([k, v]) => k + "×" + v).join(", ");
+    $("telemetrySummary").textContent =
+      s.total + " call(s) · avg " + s.avgLatencyMs + " ms · " + s.totalChars + " chars" +
+      (s.degraded ? " · " + s.degraded + " degraded" : "") + (s.errors ? " · " + s.errors + " error(s)" : "") +
+      (tools ? " · " + tools : "");
+    const rows = data.queries || [];
+    if (rows.length === 0) {
+      $("telemetry").innerHTML = "<p>No MCP tool calls recorded yet.</p>";
+      return;
+    }
+    let html = '<table><thead><tr><th>Time (UTC)</th><th>Tool</th><th>Mode</th><th>Results</th><th>Chars</th><th>Latency</th><th>Tiers</th></tr></thead><tbody>';
+    for (const q of rows) {
+      const tiers = q.tiers
+        ? "e" + (q.tiers.exact ?? 0) + "/l" + (q.tiers.lexical ?? 0) + "/s" + (q.tiers.semantic ?? 0)
+        : "—";
+      const flags = (q.degraded ? " degraded" : "") + (q.error ? " ERROR" : "");
+      html += "<tr><td class=\"mono\">" + esc(q.ts) + "</td><td><code>" + esc(q.tool) + "</code></td>" +
+        "<td>" + esc(q.mode || "—") + "</td><td>" + (q.results === null || q.results === undefined ? "—" : esc(q.results)) + "</td>" +
+        "<td>" + esc(q.chars) + "</td><td class=\"mono\">" + esc(q.latencyMs) + " ms</td>" +
+        "<td class=\"mono\">" + esc(tiers) + esc(flags) + "</td></tr>";
+    }
+    $("telemetry").innerHTML = html + "</tbody></table>";
+  } catch (e) {
+    $("telemetry").innerHTML = "<p>Telemetry unavailable: " + esc(e.message) + "</p>";
+  }
+}
+
+async function loadSnapshots() {
+  const project = $("project").value;
+  if (!project) return;
+  try {
+    const data = await api("/api/projects/" + encodeURIComponent(project) + "/snapshots?limit=20");
+    const snaps = data.snapshots || [];
+    $("snapSummary").textContent = snaps.length + " snapshot(s) retained.";
+    if (snaps.length === 0) {
+      $("snapList").innerHTML = "<p>No snapshots yet.</p>";
+      $("snapFrom").innerHTML = "";
+      $("snapTo").innerHTML = "";
+      return;
+    }
+    let html = '<table><thead><tr><th>ID</th><th>Taken (UTC)</th><th>Files</th><th>Symbols</th><th>Rels</th></tr></thead><tbody>';
+    for (const s of snaps) {
+      html += "<tr><td class=\"mono\">#" + s.id + "</td><td class=\"mono\">" + esc(s.takenAt) + "</td>" +
+        "<td>" + s.files + "</td><td>" + s.symbols + "</td><td>" + s.relationships + "</td></tr>";
+    }
+    $("snapList").innerHTML = html + "</tbody></table>";
+    const chronological = [...snaps].reverse();
+    for (const selId of ["snapFrom", "snapTo"]) {
+      const sel = $(selId);
+      sel.innerHTML = "";
+      for (const s of chronological) {
+        const opt = document.createElement("option");
+        opt.value = s.id;
+        opt.textContent = "#" + s.id + " " + s.takenAt;
+        sel.appendChild(opt);
+      }
+    }
+    if (chronological.length >= 2) {
+      $("snapFrom").value = chronological[chronological.length - 2].id;
+      $("snapTo").value = chronological[chronological.length - 1].id;
+    }
+  } catch (e) {
+    $("snapList").innerHTML = "<p>Snapshots unavailable: " + esc(e.message) + "</p>";
+  }
+}
+
+async function takeSnapshot() {
+  const project = $("project").value;
+  if (!project) return;
+  try {
+    const data = await api("/api/projects/" + encodeURIComponent(project) + "/snapshots?take=1");
+    $("snapSummary").textContent = "Captured snapshot #" + (data.snapshot && data.snapshot.id) + ".";
+    await loadSnapshots();
+  } catch (e) {
+    $("snapSummary").textContent = "Snapshot failed: " + e.message;
+  }
+}
+
+async function diffSnapshotsUI() {
+  const project = $("project").value;
+  const from = $("snapFrom").value;
+  const to = $("snapTo").value;
+  if (!project || !from || !to) return;
+  try {
+    const d = await api("/api/projects/" + encodeURIComponent(project) + "/snapshots?from=" + encodeURIComponent(from) + "&to=" + encodeURIComponent(to) + "&limit=50");
+    const section = (label, mark, rows) => {
+      if (rows.length === 0) return "";
+      return "<h3>" + label + " (" + rows.length + ")</h3><ul class=\"refs\">" +
+        rows.map((f) => "<li>" + mark + " <code>" + esc(f.name) + "</code> <span class=\"mono\">" + esc(f.path) + " [" + esc(f.kind) + "]</span></li>").join("") + "</ul>";
+    };
+    const total = d.added.length + d.removed.length + d.changed.length;
+    $("snapDiffOut").innerHTML =
+      "<p class=\"mono\">#" + d.fromId + " → #" + d.toId + " · " +
+      d.countsBefore.symbols + " → " + d.countsAfter.symbols + " symbols" +
+      (d.truncated ? " · truncated" : "") + "</p>" +
+      (total === 0 ? "<p>No structural changes.</p>" : "") +
+      section("Added", "+", d.added) + section("Removed", "−", d.removed) + section("Changed signatures", "~", d.changed);
+  } catch (e) {
+    $("snapDiffOut").innerHTML = "<p>Diff failed: " + esc(e.message) + "</p>";
+  }
+}
+
+async function loadAudit() {
+  const project = $("project").value;
+  if (!project) return;
+  try {
+    const data = await api("/api/projects/" + encodeURIComponent(project) + "/audit");
+    const reports = data.reports || [];
+    if (reports.length === 0) {
+      $("auditSummary").textContent = "No audit reports yet (the worker runs every few minutes in serve mode).";
+      $("audit").innerHTML = "";
+      return;
+    }
+    $("auditSummary").textContent = reports.map((r) => r.kind + " @ " + r.takenAt).join(" · ");
+    let html = "";
+    for (const r of reports) {
+      if (r.kind === "dead-code") {
+        const rows = (r.payload && r.payload.symbols) || [];
+        html += "<h3>Possibly dead (" + rows.length + (r.payload && r.payload.truncated ? "+ " : " ") + ")</h3>";
+        html += rows.length === 0 ? "<p>None found.</p>" : "<ul class=\"refs\">" +
+          rows.slice(0, 20).map((s) => "<li><code>" + esc(s.name) + "</code> <span class=\"mono\">" + esc(s.path) + ":" + s.start_line + " [" + esc(s.kind) + "]</span></li>").join("") + "</ul>";
+      } else if (r.kind === "duplicates") {
+        const groups = (r.payload && r.payload.groups) || [];
+        html += "<h3>Duplicate groups (" + groups.length + (r.payload && r.payload.truncated ? "+ " : " ") + ")</h3>";
+        html += groups.length === 0 ? "<p>None found.</p>" : "<ul class=\"refs\">" +
+          groups.slice(0, 20).map((g) => "<li><code>" + esc(g.key) + "</code> ×" + g.symbols.length + " <span class=\"mono\">" +
+            g.symbols.map((s) => esc(s.path) + ":" + s.start_line).join(", ") + "</span></li>").join("") + "</ul>";
+      }
+    }
+    $("audit").innerHTML = html;
+  } catch (e) {
+    $("audit").innerHTML = "<p>Audits unavailable: " + esc(e.message) + "</p>";
+  }
+}
+
+function loadPanels() { loadTelemetry(); loadSnapshots(); loadAudit(); }
+
+$("connect").addEventListener("click", () => { connect().then(loadPanels); });
+$("project").addEventListener("change", () => { renderStats(); $("results").innerHTML = ""; $("detailWrap").classList.add("hidden"); loadPanels(); });
 $("search").addEventListener("click", search);
 $("q").addEventListener("keydown", (e) => { if (e.key === "Enter") search(); });
-if (state.token) connect();
+$("telemetryRefresh").addEventListener("click", loadTelemetry);
+$("snapRefresh").addEventListener("click", loadSnapshots);
+$("snapTake").addEventListener("click", takeSnapshot);
+$("snapDiff").addEventListener("click", diffSnapshotsUI);
+$("auditRefresh").addEventListener("click", loadAudit);
+if (state.token) connect().then(loadPanels);
 </script>
 </body>
 </html>

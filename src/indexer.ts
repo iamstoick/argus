@@ -128,6 +128,8 @@ export interface WatchEmbedOpts {
   embeddings?: EmbeddingProvider | undefined;
   onVectorSync?: ((msg: string) => void) | undefined;
   projectName?: string | undefined;
+  /** Fired after a file's vectors land, so the ANN index can catch up. */
+  onVectorsSynced?: (() => void) | undefined;
 }
 
 /** Live recorder: re-index on add/change, cascade-delete on unlink. */
@@ -137,6 +139,7 @@ export function watchRoot(
   root: string,
   onError?: (err: unknown) => void,
   embedOpts?: WatchEmbedOpts | undefined,
+  afterIndex?: ((outcome: 'updated' | 'unchanged' | 'failed' | 'removed') => void) | undefined,
 ): WatchHandle {
   const watcher = watch(root, {
     ignored: (path: string, stats) => {
@@ -160,12 +163,22 @@ export function watchRoot(
       const provider = embedOpts?.embeddings;
       if (outcome === 'updated' && provider !== undefined) {
         const rel = toRelPath(root, absPath);
-        void syncSymbolVectors(db, provider, { path: rel }).catch((err: unknown) => {
-          embedOpts?.onVectorSync?.(
-            `project '${embedOpts?.projectName ?? '?'}': vector sync failed for ${rel}: ${err instanceof Error ? err.message : String(err)}`,
-          );
-        });
+        void syncSymbolVectors(db, provider, { path: rel }).then(
+          () => {
+            try {
+              embedOpts?.onVectorsSynced?.();
+            } catch {
+              // Owner hooks must not break indexing.
+            }
+          },
+          (err: unknown) => {
+            embedOpts?.onVectorSync?.(
+              `project '${embedOpts?.projectName ?? '?'}': vector sync failed for ${rel}: ${err instanceof Error ? err.message : String(err)}`,
+            );
+          },
+        );
       }
+      afterIndex?.(outcome);
     } catch (err) {
       onError?.(err);
     }
@@ -174,6 +187,7 @@ export function watchRoot(
   watcher.on('unlink', (absPath: string) => {
     try {
       db.deleteFile(toRelPath(root, absPath));
+      afterIndex?.('removed');
     } catch (err) {
       onError?.(err);
     }

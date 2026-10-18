@@ -9,7 +9,7 @@ import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 import { SYMBOL_KINDS, clampLimit, isValidProjectName } from './config.js';
 import type { IndexManager } from './projects.js';
 import { createMcpServer } from './server.js';
-import { blastRadiusData, deadCodeData, duplicateGroupsData, symbolCodeBlock } from './tools.js';
+import { blastRadiusData, deadCodeData, duplicateGroupsData, snapshotDiffData, symbolCodeBlock } from './tools.js';
 
 export interface HttpOptions {
   host: string;
@@ -160,7 +160,7 @@ export function createRequestHandler(
       sendJson(res, 200, { version: opts.version, ...manager.health() });
       return;
     }
-    const match = /^\/api\/projects\/([^/]+)\/(search|symbols|blast|duplicates|dead-code)(?:\/([^/]+))?$/.exec(
+    const match = /^\/api\/projects\/([^/]+)\/(search|symbols|blast|duplicates|dead-code|queries|snapshots|audit)(?:\/([^/]+))?$/.exec(
       url.pathname,
     );
     const seg1 = match?.[1];
@@ -220,6 +220,47 @@ export function createRequestHandler(
       const limit = clampLimit(Number(url.searchParams.get('limit') ?? Number.NaN));
       const includeExported = url.searchParams.get('include_exported') === 'true';
       sendJson(res, 200, deadCodeData(entry.db, includeExported, limit));
+      return;
+    }
+    if (action === 'queries') {
+      const limit = clampLimit(Number(url.searchParams.get('limit') ?? Number.NaN));
+      sendJson(res, 200, { stats: entry.db.queryStats(), queries: entry.db.recentQueries(limit) });
+      return;
+    }
+    if (action === 'snapshots') {
+      const limit = clampLimit(Number(url.searchParams.get('limit') ?? Number.NaN));
+      if (url.searchParams.get('take') === '1') {
+        const prev = entry.db.latestSnapshot();
+        const id = entry.db.takeSnapshot();
+        const snapshot = entry.db.listSnapshots(1)[0];
+        const diff = prev === undefined ? null : snapshotDiffData(entry.db, prev.id, id, limit);
+        sendJson(res, 200, { snapshot, previousId: prev?.id ?? null, diff });
+        return;
+      }
+      const fromRaw = url.searchParams.get('from');
+      const toRaw = url.searchParams.get('to');
+      if (fromRaw !== null || toRaw !== null) {
+        const from = fromRaw === null ? undefined : Number(fromRaw);
+        const to = toRaw === null ? undefined : Number(toRaw);
+        for (const id of [from, to]) {
+          if (id !== undefined && (!Number.isInteger(id) || id <= 0)) {
+            sendJson(res, 400, { error: 'invalid snapshot id' });
+            return;
+          }
+        }
+        const data = snapshotDiffData(entry.db, from, to, limit);
+        if ('error' in data) {
+          sendJson(res, 404, { error: data.error });
+          return;
+        }
+        sendJson(res, 200, data);
+        return;
+      }
+      sendJson(res, 200, { snapshots: entry.db.listSnapshots(limit) });
+      return;
+    }
+    if (action === 'audit') {
+      sendJson(res, 200, { reports: entry.db.latestAuditReports() });
       return;
     }
     // action === 'blast'
