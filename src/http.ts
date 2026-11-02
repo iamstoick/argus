@@ -1,4 +1,4 @@
-/** HTTP layer: MCP Streamable transport, observe-only JSON API, admin page. All token-gated. */
+/** HTTP layer: MCP Streamable transport, observe-only JSON API, admin page. Data endpoints token-gated; the admin HTML shell is public. */
 import { randomUUID, timingSafeEqual } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
@@ -134,23 +134,27 @@ export function createRequestHandler(
       res.end();
       return;
     }
+    const url = new URL(req.url ?? '/', 'http://x');
+    // Public shell: the admin page itself carries no project data. Serving it
+    // without auth fixes the browser catch-22 (browsers can't set the Bearer header
+    // on a plain visit). All data endpoints below stay token-gated, and the page's
+    // JS sends the token via Authorization header from its token field.
+    if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/index.html')) {
+      adminHtml ??= adminPageHtml();
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+      res.end(adminHtml);
+      return;
+    }
     if (!authorized(req, opts.token)) {
       sendJson(res, 401, { error: 'missing or invalid bearer token' });
       return;
     }
-    const url = new URL(req.url ?? '/', 'http://x');
     if (url.pathname === '/mcp') {
       await handleMcp(req, res);
       return;
     }
     if (req.method !== 'GET') {
       sendJson(res, 404, { error: 'not found' });
-      return;
-    }
-    if (url.pathname === '/' || url.pathname === '/index.html') {
-      adminHtml ??= adminPageHtml();
-      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
-      res.end(adminHtml);
       return;
     }
     if (url.pathname === '/api/projects') {

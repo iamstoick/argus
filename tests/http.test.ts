@@ -242,14 +242,27 @@ describe('http handler', () => {
     }
   });
 
-  it('serves the admin page', async () => {
+  it('serves the admin page shell publicly while gating data', async () => {
     const t = await setupManager();
     try {
       const handler = createRequestHandler(t.manager, { host: '127.0.0.1', port: 0, token: TOKEN, version: 'test' });
+      // No token: page shell loads so a plain browser visit works.
+      const anon = new MockRes();
+      await handler(asReq(new MockReq('GET', '/')), asRes(anon));
+      assert.equal(anon.statusCode, 200);
+      assert.match(anon.contentType, /text\/html/);
+      assert.match(anon.body, /Argus/);
+      const anonIndex = new MockRes();
+      await handler(asReq(new MockReq('GET', '/index.html')), asRes(anonIndex));
+      assert.equal(anonIndex.statusCode, 200);
+      // No token: data endpoints stay gated.
+      const gated = new MockRes();
+      await handler(asReq(new MockReq('GET', '/api/projects')), asRes(gated));
+      assert.equal(gated.statusCode, 401);
+      // Token: page shell still loads.
       const { req, res } = authed('/');
       await handler(asReq(req), asRes(res));
       assert.equal(res.statusCode, 200);
-      assert.match(res.contentType, /text\/html/);
       assert.match(res.body, /Argus/);
     } finally {
       await teardownManager(t);
