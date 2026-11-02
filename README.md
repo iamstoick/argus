@@ -485,8 +485,10 @@ index, it says so instead of showing stale code.
 `symbol_name` first tries an exact match, then a `LIKE` fallback (up to 5
 candidates). Output has two halves: **outgoing** (everything the matched
 symbols call) and **incoming** (everything calling the matched simple names,
-deduped, with a `+` marker when the limit cut the list). Always call this
-before renaming or re-signaturing.
+deduped, with a `+` marker when the limit cut the list). Every edge carries a
+confidence tag: `[EXTRACTED]` (direct syntactic ref), `[INFERRED]` (member
+call rebound by simple name), `[AMBIGUOUS]` (unresolved or shared by several
+symbols). Always call this before renaming or re-signaturing.
 
 ### `find_duplicates`
 
@@ -502,7 +504,9 @@ Symbols nothing calls. Conservative by construction: callee matching uses
 simple names, so *any* same-named call keeps a symbol alive; `main`,
 constructors (`constructor`, `__construct`, `__init__`, `initialize`) and
 dunder methods (`__len__`, …) are never reported. Exported symbols are
-skipped unless `include_exported: true`. Caveat: framework entry points wired
+skipped unless `include_exported: true`. A second section flags symbols kept
+alive by inferred/ambiguous refs only — still alive, but worth reviewing.
+Caveat: framework entry points wired
 by decorator/string (route handlers, callbacks) can still look dead — review
 before deleting.
 
@@ -875,6 +879,8 @@ else on that port. Check `/api/health` with curl first.
 - Environments without file-watching support should use `--no-watch` (index stays as of
   startup sync; restart to re-sync).
 - Snapshot diffs have no rename/move detection: a rename is an add plus a remove.
+- Rows indexed before confidence tracking read `EXTRACTED`; member-call
+  `INFERRED` labels apply as files re-parse through the normal hash-delta sync.
 - Semantic top-k is approximate (HNSW); exact brute force is only the pre-ready fallback.
 - Histories are capped: 1000 telemetry rows, 20 snapshots, 10 audit reports per kind.
 - `/mcp` request bodies cap at 1 MB.

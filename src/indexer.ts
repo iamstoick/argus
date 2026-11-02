@@ -91,7 +91,9 @@ export function indexFile(
   }));
   const rels: NewRelationship[] = [];
   parsed.symbols.forEach((s, callerIndex) => {
-    for (const c of s.calls) rels.push({ callerIndex, calleeName: c.callee, type: c.type });
+    for (const c of s.calls) {
+      rels.push({ callerIndex, calleeName: c.callee, type: c.type, confidence: c.confidence });
+    }
   });
   db.replaceFile(rel, hash, symbols, rels);
   return 'updated';

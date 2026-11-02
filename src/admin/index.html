@@ -325,7 +325,8 @@ function refList(rels) {
   let html = "<ul class=\"refs\">";
   for (const r of rels) {
     html += "<li><code>" + esc(r.caller_name) + "</code> —" + esc(r.relationship_type) + "→ <code>" +
-      esc(r.callee_name) + "</code> <span class=\"mono\">" + esc(r.caller_path) + ":" + esc(r.caller_line) + "</span></li>";
+      esc(r.callee_name) + "</code> [" + esc(r.effective_confidence || r.confidence || "?") + "] <span class=\"mono\">" +
+      esc(r.caller_path) + ":" + esc(r.caller_line) + "</span></li>";
   }
   return html + "</ul>";
 }

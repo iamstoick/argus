@@ -11,8 +11,8 @@ function seed(db: ArgusDb): void {
       { name: 'Store.save', kind: 'method', signature: 'save(x)', docstring: 'Saves.', startLine: 5, endLine: 8, isExported: true },
     ],
     [
-      { callerIndex: 1, calleeName: 'add', type: 'calls' },
-      { callerIndex: 1, calleeName: 'Base', type: 'extends' },
+      { callerIndex: 1, calleeName: 'add', type: 'calls', confidence: 'EXTRACTED' },
+      { callerIndex: 1, calleeName: 'Base', type: 'extends', confidence: 'EXTRACTED' },
     ],
   );
   db.replaceFile(
@@ -104,8 +104,8 @@ describe('ArgusDb', () => {
         'h',
         [{ name: 'f', kind: 'function', signature: 'f()', docstring: null, startLine: 1, endLine: 1, isExported: true }],
         [
-          { callerIndex: 0, calleeName: 'g', type: 'calls' },
-          { callerIndex: 0, calleeName: 'g', type: 'calls' },
+          { callerIndex: 0, calleeName: 'g', type: 'calls', confidence: 'EXTRACTED' },
+          { callerIndex: 0, calleeName: 'g', type: 'calls', confidence: 'EXTRACTED' },
         ],
       );
       assert.equal(db.outgoing([1]).length, 1);

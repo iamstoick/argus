@@ -119,6 +119,24 @@ export const SYMBOL_KINDS: ReadonlySet<string> = new Set<string>([
 
 export type RelationshipType = 'calls' | 'extends' | 'implements';
 
+/**
+ * Provenance of one relationship edge (Graphify-style honesty labels).
+ * EXTRACTED: stated directly in syntax (direct call, extends/implements).
+ * INFERRED: reasonable deduction (member/property call rebound by simple name).
+ * AMBIGUOUS: unresolved or multi-candidate at query time; flagged for review.
+ */
+export type RelationshipConfidence = 'EXTRACTED' | 'INFERRED' | 'AMBIGUOUS';
+
+export const RELATIONSHIP_CONFIDENCE: ReadonlySet<string> = new Set<string>([
+  'EXTRACTED',
+  'INFERRED',
+  'AMBIGUOUS',
+]);
+
+export function isRelationshipConfidence(value: string): value is RelationshipConfidence {
+  return RELATIONSHIP_CONFIDENCE.has(value);
+}
+
 export function languageForPath(filePath: string): LanguageId | undefined {
   const dot = filePath.lastIndexOf('.');
   if (dot < 0) return undefined;

@@ -21,8 +21,8 @@ function seed(): ArgusDb {
       { name: 'User', kind: 'class', signature: 'class User', docstring: null, startLine: 11, endLine: 20, isExported: true },
     ],
     [
-      { callerIndex: 0, calleeName: 'clamp', type: 'calls' },
-      { callerIndex: 1, calleeName: 'clamp', type: 'calls' },
+      { callerIndex: 0, calleeName: 'clamp', type: 'calls', confidence: 'EXTRACTED' },
+      { callerIndex: 1, calleeName: 'clamp', type: 'calls', confidence: 'EXTRACTED' },
     ],
   );
   db.replaceFile(
@@ -41,8 +41,8 @@ function seed(): ArgusDb {
       { name: 'User', kind: 'class', signature: 'class User', docstring: null, startLine: 11, endLine: 20, isExported: true },
     ],
     [
-      { callerIndex: 0, calleeName: 'clamp', type: 'calls' },
-      { callerIndex: 1, calleeName: 'clamp', type: 'calls' },
+      { callerIndex: 0, calleeName: 'clamp', type: 'calls', confidence: 'EXTRACTED' },
+      { callerIndex: 1, calleeName: 'clamp', type: 'calls', confidence: 'EXTRACTED' },
     ],
   );
   db.takeSnapshot();

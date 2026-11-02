@@ -1,7 +1,12 @@
 /** MCP tool implementations (pure handlers over db + workspace root). */
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { SYMBOL_KINDS, clampLimit, truncateOutput } from './config.js';
+import {
+  SYMBOL_KINDS,
+  clampLimit,
+  truncateOutput,
+  type RelationshipConfidence,
+} from './config.js';
 import { ArgusDb, type RelationRow, type SymbolFingerprint, type SymbolRow } from './db.js';
 import { cosineSimilarity, type EmbeddingProvider } from './embeddings.js';
 import { simpleName } from './parser.js';
@@ -228,10 +233,37 @@ export interface BlastArgs {
   limit?: number | undefined;
 }
 
+/** One stored edge plus its query-time resolution label. */
+export interface BlastRelation extends RelationRow {
+  effective_confidence: RelationshipConfidence;
+}
+
+/**
+ * Effective label for one stored edge: stored provenance widened to AMBIGUOUS
+ * when the callee name resolves to zero symbols (external/unresolved) or to
+ * several (a simple-name match cannot decide). Pass a cache to share
+ * resolution counts across the edges of one tool call.
+ */
+export function edgeConfidence(
+  db: ArgusDb,
+  rel: RelationRow,
+  cache?: Map<string, number> | undefined,
+): RelationshipConfidence {
+  const stored: RelationshipConfidence =
+    rel.confidence === 'INFERRED' || rel.confidence === 'AMBIGUOUS' ? rel.confidence : 'EXTRACTED';
+  if (stored === 'AMBIGUOUS') return 'AMBIGUOUS';
+  let candidates = cache?.get(rel.callee_name);
+  if (candidates === undefined) {
+    candidates = db.countSymbolsBySimpleName(simpleName(rel.callee_name));
+    cache?.set(rel.callee_name, candidates);
+  }
+  return candidates === 1 ? stored : 'AMBIGUOUS';
+}
+
 export interface BlastData {
   matched: SymbolRow[];
-  outgoing: RelationRow[];
-  incoming: RelationRow[];
+  outgoing: BlastRelation[];
+  incoming: BlastRelation[];
   incomingTruncated: boolean;
 }
 
@@ -244,15 +276,20 @@ export function blastRadiusData(db: ArgusDb, rawName: string, rawLimit: number |
   const matched = targets.length > 0 ? targets : db.symbolsByNameLike(name, 5);
   if (matched.length === 0) return { error: `No symbol matching '${name}'.` };
   const ids = matched.map((r) => r.id);
-  const outgoing = db.outgoing(ids).slice(0, limit);
+  const cache = new Map<string, number>();
+  const score = (rel: RelationRow): BlastRelation => ({
+    ...rel,
+    effective_confidence: edgeConfidence(db, rel, cache),
+  });
+  const outgoing = db.outgoing(ids).slice(0, limit).map(score);
   const incomingSeen = new Set<string>();
-  const incoming: RelationRow[] = [];
+  const incoming: BlastRelation[] = [];
   for (const simple of new Set(matched.map((r) => simpleName(r.name)))) {
     for (const rel of db.incoming(simple, limit)) {
       const key = `${rel.caller_id}:${rel.relationship_type}`;
       if (incomingSeen.has(key)) continue;
       incomingSeen.add(key);
-      incoming.push(rel);
+      incoming.push(score(rel));
       if (incoming.length >= limit) break;
     }
     if (incoming.length >= limit) break;
@@ -272,16 +309,19 @@ export function checkBlastRadius(db: ArgusDb, args: BlastArgs): string {
   if (data.outgoing.length === 0) out.push('  (none recorded)');
   for (const rel of data.outgoing) {
     out.push(
-      `  ${rel.caller_name} --${rel.relationship_type}--> ${rel.callee_name} (${rel.caller_path}:${rel.caller_line})`,
+      `  ${rel.caller_name} --${rel.relationship_type}--> ${rel.callee_name} [${rel.effective_confidence}] (${rel.caller_path}:${rel.caller_line})`,
     );
   }
   out.push('', `Incoming dependents (${data.incoming.length}${data.incomingTruncated ? '+' : ''}):`);
   if (data.incoming.length === 0) out.push('  (none recorded)');
   for (const rel of data.incoming) {
     out.push(
-      `  ${rel.caller_name} --${rel.relationship_type}--> ${rel.callee_name} (${rel.caller_path}:${rel.caller_line})`,
+      `  ${rel.caller_name} --${rel.relationship_type}--> ${rel.callee_name} [${rel.effective_confidence}] (${rel.caller_path}:${rel.caller_line})`,
     );
   }
+  out.push(
+    'Confidence: EXTRACTED = direct syntactic ref; INFERRED = member call matched by name; AMBIGUOUS = unresolved or shared name.',
+  );
   return truncateOutput(out.join('\n'));
 }
 
@@ -392,7 +432,13 @@ export function findDuplicates(db: ArgusDb, args: DuplicatesArgs): string {
 
 export interface DeadCodeData {
   symbols: SymbolRow[];
+  /**
+   * Alive only because of inferred/ambiguous refs: kept by the conservative
+   * liveness rule, but flagged here for human review.
+   */
+  review: SymbolRow[];
   truncated: boolean;
+  reviewTruncated: boolean;
 }
 
 /** Implicitly-invoked names that never appear as call targets (conservative: never reported dead). */
@@ -405,9 +451,10 @@ function isEntryish(simple: string): boolean {
 
 /**
  * Symbols nothing calls. Conservative by construction: callee matching uses
- * simple names, so any same-named call keeps a symbol alive. Framework entry
- * points wired by decorator (route handlers) can still appear dead — review
- * before deleting.
+ * simple names, so any same-named call keeps a symbol alive. Symbols kept
+ * alive only by inferred or ambiguous refs land in `review` instead of the
+ * dead list. Framework entry points wired by decorator (route handlers) can
+ * still appear dead — review before deleting.
  */
 export function deadCodeData(
   db: ArgusDb,
@@ -417,20 +464,38 @@ export function deadCodeData(
   const limit = clampLimit(rawLimit);
   const includeExported = rawIncludeExported === true;
   const callees = db.allCalleeNames();
-  const dead = db
-    .allSymbols()
-    .filter((s) => {
-      if (!includeExported && s.is_exported === 1) return false;
-      const simple = simpleName(s.name);
-      if (isEntryish(simple)) return false;
-      return !callees.has(simple);
-    })
-    .sort((a, b) => {
-      const pa = a.path ?? '';
-      const pb = b.path ?? '';
-      return pa < pb ? -1 : pa > pb ? 1 : a.start_line - b.start_line;
-    });
-  return { symbols: dead.slice(0, limit), truncated: dead.length > limit };
+  // Callee names with at least one uniquely-resolved EXTRACTED edge.
+  const extractedAlive = new Set<string>();
+  const counts = new Map<string, number>();
+  for (const name of callees) {
+    let n = counts.get(name);
+    if (n === undefined) {
+      n = db.countSymbolsBySimpleName(simpleName(name));
+      counts.set(name, n);
+    }
+    if (n === 1 && db.storedConfidencesForCallee(name).includes('EXTRACTED')) {
+      extractedAlive.add(name);
+    }
+  }
+  const byLocation = (a: SymbolRow, b: SymbolRow): number => {
+    const pa = a.path ?? '';
+    const pb = b.path ?? '';
+    return pa < pb ? -1 : pa > pb ? 1 : a.start_line - b.start_line;
+  };
+  const eligible = db.allSymbols().filter((s) => {
+    if (!includeExported && s.is_exported === 1) return false;
+    return !isEntryish(simpleName(s.name));
+  });
+  const dead = eligible.filter((s) => !callees.has(simpleName(s.name))).sort(byLocation);
+  const review = eligible
+    .filter((s) => callees.has(simpleName(s.name)) && !extractedAlive.has(simpleName(s.name)))
+    .sort(byLocation);
+  return {
+    symbols: dead.slice(0, limit),
+    review: review.slice(0, limit),
+    truncated: dead.length > limit,
+    reviewTruncated: review.length > limit,
+  };
 }
 
 export interface DeadCodeArgs {
@@ -448,9 +513,15 @@ export function findDeadCode(db: ArgusDb, args: DeadCodeArgs): string {
   const lines: string[] = [
     `Found ${data.symbols.length} possibly-dead symbol(s)${data.truncated ? ' (truncated)' : ''}:`,
     ...data.symbols.map((s) => `- #${s.id} ${s.name} [${s.kind}]${s.is_exported === 1 ? ' ✓exported' : ''} ${s.path}:${s.start_line}`),
-    'Review before deleting: framework entry points (e.g. route handlers) can appear dead.',
   ];
-  if (data.truncated) lines.push('…more exist; raise the limit.');
+  if (data.review.length > 0) {
+    lines.push(
+      `Kept alive by inferred/ambiguous refs only (${data.review.length}${data.reviewTruncated ? '+' : ''}) — review before trusting:`,
+      ...data.review.map((s) => `- #${s.id} ${s.name} [${s.kind}]${s.is_exported === 1 ? ' ✓exported' : ''} ${s.path}:${s.start_line}`),
+    );
+  }
+  lines.push('Review before deleting: framework entry points (e.g. route handlers) can appear dead.');
+  if (data.truncated || data.reviewTruncated) lines.push('…more exist; raise the limit.');
   return truncateOutput(lines.join('\n'));
 }
 

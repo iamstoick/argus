@@ -20,7 +20,7 @@ function seed(): ArgusDb {
       { name: 'Repo.save', kind: 'method', signature: 'save(self, x)', docstring: null, startLine: 26, endLine: 27, isExported: false },
       { name: 'Config', kind: 'class', signature: 'class Config', docstring: null, startLine: 29, endLine: 30, isExported: true },
     ],
-    [{ callerIndex: 0, calleeName: 'used', type: 'calls' }],
+    [{ callerIndex: 0, calleeName: 'used', type: 'calls', confidence: 'EXTRACTED' }],
   );
   db.replaceFile(
     'b.ts',

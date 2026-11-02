@@ -10,6 +10,7 @@ import {
   compact,
   languageForPath,
   type LanguageId,
+  type RelationshipConfidence,
   type RelationshipType,
   type SymbolKind,
 } from './config.js';
@@ -18,6 +19,7 @@ import { queriesFor } from './queries.js';
 export interface ParsedCall {
   callee: string;
   type: RelationshipType;
+  confidence: RelationshipConfidence;
 }
 
 export interface ParsedSymbol {
@@ -83,6 +85,20 @@ const KIND_PRIORITY: Readonly<Record<string, number>> = {
 
 /** Safety cap so pathological files cannot flood the relationships table. */
 const MAX_CALLS_PER_SYMBOL = 500;
+
+/**
+ * Tree-sitter node types whose child is a member/property name rather than a
+ * direct callee: the receiver is unknown, so the recorded edge is INFERRED.
+ */
+const MEMBER_PARENT_TYPES: ReadonlySet<string> = new Set([
+  'member_expression', // js/ts: obj.foo()
+  'attribute', // python: obj.foo()
+  'selector_expression', // go: pkg.Fn() / obj.Method()
+  'field_expression', // rust: obj.method()
+  'scoped_identifier', // rust: mod::func()
+  'member_call_expression', // php: $obj->foo()
+  'scoped_call_expression', // php: Class::foo()
+]);
 
 interface DeclEntry {
   node: Node;
@@ -404,7 +420,7 @@ export class ParserEngine {
 
   private extractCalls(loaded: LoadedLanguage, declNode: Node): ParsedCall[] {
     const calls: ParsedCall[] = [];
-    const seen = new Set<string>();
+    const seen = new Map<string, number>();
     for (const match of loaded.refQuery.matches(declNode)) {
       for (const cap of match.captures) {
         let type: RelationshipType | undefined;
@@ -414,13 +430,31 @@ export class ParserEngine {
         if (type === undefined) continue;
         const callee = simpleName(cap.node.text);
         if (callee === '') continue;
+        const confidence = this.callConfidence(type, cap.node.parent?.type);
         const key = `${type}:${callee}`;
-        if (seen.has(key)) continue;
-        seen.add(key);
-        calls.push({ callee, type });
+        const prevIdx = seen.get(key);
+        if (prevIdx === undefined) {
+          seen.set(key, calls.length);
+          calls.push({ callee, type, confidence });
+        } else if (confidence === 'EXTRACTED' && calls[prevIdx]?.confidence !== 'EXTRACTED') {
+          // Same callee reached both directly and via a member: keep the stronger edge.
+          calls[prevIdx] = { callee, type, confidence };
+        }
         if (calls.length >= MAX_CALLS_PER_SYMBOL) return calls;
       }
     }
     return calls;
+  }
+
+  /**
+   * Provenance of one captured ref. Declaration refs (extends/implements) and
+   * direct calls name their target outright; member/property calls only record
+   * the property name while the receiver is unknown, so rebinding is inferred.
+   */
+  private callConfidence(type: RelationshipType, parentType: string | undefined): RelationshipConfidence {
+    if (type === 'calls' && parentType !== undefined && MEMBER_PARENT_TYPES.has(parentType)) {
+      return 'INFERRED';
+    }
+    return 'EXTRACTED';
   }
 }

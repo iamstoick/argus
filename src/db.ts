@@ -1,7 +1,7 @@
 /** SQLite storage layer (node:sqlite, embedded). All queries parameterized. */
 import { createHash } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
-import { LIMITS, type RelationshipType, type SymbolKind } from './config.js';
+import { LIMITS, type RelationshipConfidence, type RelationshipType, type SymbolKind } from './config.js';
 import type { EmbeddingUsage } from './embeddings.js';
 
 export interface FileRow {
@@ -38,6 +38,7 @@ export interface NewRelationship {
   callerIndex: number;
   calleeName: string;
   type: RelationshipType;
+  confidence: RelationshipConfidence;
 }
 
 const SCHEMA = `
@@ -66,6 +67,7 @@ CREATE TABLE IF NOT EXISTS symbol_relationships (
   caller_symbol_id INTEGER NOT NULL,
   callee_name TEXT NOT NULL,
   relationship_type TEXT,
+  confidence TEXT NOT NULL DEFAULT 'EXTRACTED',
   FOREIGN KEY(caller_symbol_id) REFERENCES symbols(id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_symbol_name ON symbols(name);
@@ -367,6 +369,8 @@ export interface RelationRow {
   caller_line: number;
   callee_name: string;
   relationship_type: string;
+  /** Stored provenance: 'EXTRACTED' | 'INFERRED' (query-time resolution may widen to AMBIGUOUS). */
+  confidence: string;
 }
 
 function toRelationRow(value: unknown): RelationRow {
@@ -378,6 +382,7 @@ function toRelationRow(value: unknown): RelationRow {
     caller_line: reqNumber(value, 'caller_line'),
     callee_name: reqString(value, 'callee_name'),
     relationship_type: reqString(value, 'relationship_type'),
+    confidence: reqString(value, 'confidence'),
   };
 }
 
@@ -449,7 +454,26 @@ export class ArgusDb {
   constructor(dbPath: string) {
     this.db = new DatabaseSync(dbPath);
     this.db.exec(SCHEMA);
+    this.ensureConfidenceColumn();
     this.setupFts();
+  }
+
+  /**
+   * Pre-confidence databases have symbol_relationships without the column.
+   * Backfill reads EXTRACTED (rows were AST-extracted); member-call INFERRED
+   * labels apply as files re-parse through the normal hash-delta sync.
+   */
+  private ensureConfidenceColumn(): void {
+    let has = false;
+    for (const row of this.db.prepare('PRAGMA table_info(symbol_relationships)').all()) {
+      if (isRecord(row) && row['name'] === 'confidence') {
+        has = true;
+        break;
+      }
+    }
+    if (!has) {
+      this.db.exec(`ALTER TABLE symbol_relationships ADD COLUMN confidence TEXT NOT NULL DEFAULT 'EXTRACTED'`);
+    }
   }
 
   private setupFts(): void {
@@ -619,8 +643,8 @@ export class ArgusDb {
        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
     );
     const insRel = this.db.prepare(
-      `INSERT INTO symbol_relationships (caller_symbol_id, callee_name, relationship_type)
-       VALUES (?, ?, ?)`,
+      `INSERT INTO symbol_relationships (caller_symbol_id, callee_name, relationship_type, confidence)
+       VALUES (?, ?, ?, ?)`,
     );
 
     const txn = (): void => {
@@ -645,14 +669,21 @@ export class ArgusDb {
         if (typeof lastId !== 'number') throw new Error('DB: missing lastInsertRowid');
         ids.push(lastId);
       }
-      const seen = new Set<string>();
+      // Same caller+callee+type from two syntactic forms: keep the stronger edge.
+      const merged = new Map<string, NewRelationship>();
       for (const rel of rels) {
         const callerId = ids[rel.callerIndex];
         if (callerId === undefined) continue;
         const key = `${callerId}→${rel.type}:${rel.calleeName}`;
-        if (seen.has(key)) continue;
-        seen.add(key);
-        insRel.run(callerId, rel.calleeName, rel.type);
+        const prev = merged.get(key);
+        if (prev === undefined || (prev.confidence !== 'EXTRACTED' && rel.confidence === 'EXTRACTED')) {
+          merged.set(key, rel);
+        }
+      }
+      for (const rel of merged.values()) {
+        const callerId = ids[rel.callerIndex];
+        if (callerId === undefined) continue;
+        insRel.run(callerId, rel.calleeName, rel.type, rel.confidence);
       }
     };
 
@@ -1032,7 +1063,7 @@ export class ArgusDb {
     return this.db
       .prepare(
         `SELECT r.caller_symbol_id AS caller_id, s.name AS caller_name, f.path AS caller_path,
-                s.start_line AS caller_line, r.callee_name, r.relationship_type
+                s.start_line AS caller_line, r.callee_name, r.relationship_type, r.confidence AS confidence
          FROM symbol_relationships r
          JOIN symbols s ON s.id = r.caller_symbol_id
          JOIN files f ON f.id = s.file_id
@@ -1047,7 +1078,7 @@ export class ArgusDb {
     return this.db
       .prepare(
         `SELECT r.caller_symbol_id AS caller_id, s.name AS caller_name, f.path AS caller_path,
-                s.start_line AS caller_line, r.callee_name, r.relationship_type
+                s.start_line AS caller_line, r.callee_name, r.relationship_type, r.confidence AS confidence
          FROM symbol_relationships r
          JOIN symbols s ON s.id = r.caller_symbol_id
          JOIN files f ON f.id = s.file_id
@@ -1055,5 +1086,26 @@ export class ArgusDb {
       )
       .all(calleeName, limit)
       .map(toRelationRow);
+  }
+
+  /** Symbols whose qualified name is `simple` or ends with `.simple` (resolution set for one edge). */
+  countSymbolsBySimpleName(simple: string): number {
+    const row = this.db
+      .prepare(`SELECT COUNT(*) AS n FROM symbols WHERE name = ?1 OR name LIKE '%.' || ?2 ESCAPE '\\'`)
+      .get(simple, escapeLike(simple));
+    if (!isRecord(row)) throw new Error('DB row: expected record');
+    return reqNumber(row, 'n');
+  }
+
+  /** Stored provenance of every edge naming one callee (liveness honesty for dead-code review). */
+  storedConfidencesForCallee(calleeName: string): string[] {
+    const out: string[] = [];
+    for (const row of this.db
+      .prepare('SELECT confidence FROM symbol_relationships WHERE callee_name = ?')
+      .all(calleeName)) {
+      if (!isRecord(row)) throw new Error('DB row: expected record');
+      out.push(reqString(row, 'confidence'));
+    }
+    return out;
   }
 }
