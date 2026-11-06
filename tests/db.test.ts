@@ -127,6 +127,36 @@ describe('ArgusDb', () => {
     }
   });
 
+  it('retries file writes across a transient writer lock', () => {
+    const db = new ArgusDb(':memory:');
+    try {
+      const inner = (db as unknown as { db: { exec: (sql: string) => void } }).db;
+      const origExec = inner.exec.bind(inner);
+      let begins = 0;
+      inner.exec = (sql: string) => {
+        if (sql.includes('BEGIN IMMEDIATE') && begins++ === 0) {
+          throw Object.assign(new Error('database is locked'), { code: 'SQLITE_BUSY' });
+        }
+        return origExec(sql);
+      };
+      try {
+        db.replaceFile(
+          'a.ts',
+          'h',
+          [{ name: 'f', kind: 'function', signature: 'f()', docstring: null, startLine: 1, endLine: 1, isExported: true }],
+          [],
+        );
+      } finally {
+        inner.exec = origExec;
+      }
+      assert.equal(begins, 2);
+      assert.equal(db.getFile('a.ts')?.hash, 'h');
+      assert.equal(db.countSymbols(), 1);
+    } finally {
+      db.close();
+    }
+  });
+
   it('lists exported symbols by module prefix', () => {
     const db = new ArgusDb(':memory:');
     try {

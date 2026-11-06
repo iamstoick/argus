@@ -43,6 +43,7 @@ export interface NewRelationship {
 
 const SCHEMA = `
 PRAGMA journal_mode = WAL;
+PRAGMA busy_timeout = 5000;
 PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS files (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -429,6 +430,29 @@ export function cappedEditDistance(a: string, b: string, max: number): number {
   return prev[b.length] as number;
 }
 
+/**
+ * Writer contention (watcher + vector sync + tool writes on one DB file, or
+ * two servers on one project root) surfaces as SQLITE_BUSY. Brief waits
+ * absorb it; without them the watcher drops the file update.
+ */
+const BUSY_RETRY_ATTEMPTS = 8;
+const BUSY_RETRY_BASE_MS = 25;
+
+function isBusyError(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  const code = (err as { code?: unknown }).code;
+  if (typeof code === 'string' && code.toUpperCase().includes('BUSY')) return true;
+  return /database is (locked|busy)|SQLITE_BUSY/i.test(err.message);
+}
+
+/** Brief synchronous backoff; write paths are sync, so no timers apply. */
+function spinWait(ms: number): void {
+  const end = Date.now() + ms;
+  while (Date.now() < end) {
+    // Intentional busy-wait: tens of ms, only on lock contention.
+  }
+}
+
 function encodeVector(vec: number[]): Buffer {
   return Buffer.from(new Float64Array(vec).buffer);
 }
@@ -506,6 +530,41 @@ export class ArgusDb {
 
   close(): void {
     this.db.close();
+  }
+
+  /**
+   * Run a BEGIN IMMEDIATE..COMMIT unit, retrying transient SQLITE_BUSY
+   * (another writer holds the file). node:sqlite has no transaction helper;
+   * use explicit SQL. Non-busy errors throw after one rollback.
+   */
+  private writeTxn(work: () => void): void {
+    for (let attempt = 1; ; attempt += 1) {
+      try {
+        this.db.exec('BEGIN IMMEDIATE');
+      } catch (err) {
+        if (isBusyError(err) && attempt < BUSY_RETRY_ATTEMPTS) {
+          spinWait(BUSY_RETRY_BASE_MS * attempt);
+          continue;
+        }
+        throw err;
+      }
+      try {
+        work();
+        this.db.exec('COMMIT');
+        return;
+      } catch (err) {
+        try {
+          this.db.exec('ROLLBACK');
+        } catch {
+          // Rollback is best-effort; report the original failure below.
+        }
+        if (isBusyError(err) && attempt < BUSY_RETRY_ATTEMPTS) {
+          spinWait(BUSY_RETRY_BASE_MS * attempt);
+          continue;
+        }
+        throw err;
+      }
+    }
   }
 
   getFile(path: string): FileRow | undefined {
@@ -687,15 +746,7 @@ export class ArgusDb {
       }
     };
 
-    // node:sqlite has no transaction helper; use explicit SQL.
-    this.db.exec('BEGIN IMMEDIATE');
-    try {
-      txn();
-      this.db.exec('COMMIT');
-    } catch (err) {
-      this.db.exec('ROLLBACK');
-      throw err;
-    }
+    this.writeTxn(txn);
   }
 
   deleteFile(path: string): void {
@@ -789,14 +840,9 @@ export class ArgusDb {
     const stmt = this.db.prepare(
       'INSERT INTO symbol_vectors (symbol_id, dim, vec) VALUES (?, ?, ?) ON CONFLICT(symbol_id) DO UPDATE SET dim = excluded.dim, vec = excluded.vec',
     );
-    this.db.exec('BEGIN IMMEDIATE');
-    try {
+    this.writeTxn(() => {
       for (const r of rows) stmt.run(r.symbolId, r.dim, encodeVector(r.vec));
-      this.db.exec('COMMIT');
-    } catch (err) {
-      this.db.exec('ROLLBACK');
-      throw err;
-    }
+    });
   }
 
   symbolVectors(): SymbolVector[] {
