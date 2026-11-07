@@ -445,6 +445,10 @@ function isBusyError(err: unknown): boolean {
   return /database is (locked|busy)|SQLITE_BUSY/i.test(err.message);
 }
 
+function isForeignKeyError(err: unknown): boolean {
+  return err instanceof Error && /foreign key constraint failed/i.test(err.message);
+}
+
 /** Brief synchronous backoff; write paths are sync, so no timers apply. */
 function spinWait(ms: number): void {
   const end = Date.now() + ms;
@@ -834,15 +838,41 @@ export class ArgusDb {
     return scored.slice(0, limit).map((s) => s.row);
   }
 
-  /** Upsert embedding vectors keyed by symbol id. */
+  /**
+   * Upsert embedding vectors keyed by symbol id. Rows for symbols deleted
+   * after the ids were read (a watcher re-parse churns ids while embedding
+   * calls are in flight) are skipped: their vectors are garbage, and the
+   * next sync embeds the replacement ids. Never throws for stale ids.
+   */
   replaceVectors(rows: SymbolVector[]): void {
     if (rows.length === 0) return;
     const stmt = this.db.prepare(
       'INSERT INTO symbol_vectors (symbol_id, dim, vec) VALUES (?, ?, ?) ON CONFLICT(symbol_id) DO UPDATE SET dim = excluded.dim, vec = excluded.vec',
     );
-    this.writeTxn(() => {
-      for (const r of rows) stmt.run(r.symbolId, r.dim, encodeVector(r.vec));
-    });
+    const liveIds = (): Set<number> => {
+      const out = new Set<number>();
+      for (const row of this.db.prepare('SELECT id FROM symbols').all()) {
+        if (!isRecord(row)) throw new Error('DB row: expected record');
+        out.add(reqNumber(row, 'id'));
+      }
+      return out;
+    };
+    // A same-thread re-parse cannot interleave the sync check below, but a
+    // second server on the same DB file can delete between check and write.
+    for (let attempt = 1; ; attempt += 1) {
+      const live = liveIds();
+      const fresh = rows.filter((r) => live.has(r.symbolId));
+      if (fresh.length === 0) return;
+      try {
+        this.writeTxn(() => {
+          for (const r of fresh) stmt.run(r.symbolId, r.dim, encodeVector(r.vec));
+        });
+        return;
+      } catch (err) {
+        if (isForeignKeyError(err) && attempt < 3) continue;
+        throw err;
+      }
+    }
   }
 
   symbolVectors(): SymbolVector[] {

@@ -157,6 +157,35 @@ describe('ArgusDb', () => {
     }
   });
 
+  it('skips vectors for symbols deleted before the write lands', () => {
+    const db = new ArgusDb(':memory:');
+    try {
+      db.replaceFile(
+        'a.ts',
+        'h',
+        [{ name: 'f', kind: 'function', signature: 'f()', docstring: null, startLine: 1, endLine: 1, isExported: true }],
+        [],
+      );
+      const staleId = db.symbolsByNameExact('f')[0]?.id ?? 0;
+      // A watcher re-parse churns symbol ids (FK cascade clears old vectors).
+      db.replaceFile(
+        'a.ts',
+        'h2',
+        [{ name: 'g', kind: 'function', signature: 'g()', docstring: null, startLine: 1, endLine: 1, isExported: true }],
+        [],
+      );
+      const liveId = db.symbolsByNameExact('g')[0]?.id ?? 0;
+      db.replaceVectors([
+        { symbolId: staleId, dim: 2, vec: [1, 0] },
+        { symbolId: liveId, dim: 2, vec: [0, 1] },
+      ]);
+      assert.equal(db.countVectors(), 1);
+      assert.deepEqual(db.vectorById(liveId)?.vec, [0, 1]);
+    } finally {
+      db.close();
+    }
+  });
+
   it('lists exported symbols by module prefix', () => {
     const db = new ArgusDb(':memory:');
     try {
