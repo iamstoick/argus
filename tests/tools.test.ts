@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { ArgusDb } from '../src/db.js';
 import { ParserEngine } from '../src/parser.js';
 import { syncRoot } from '../src/indexer.js';
-import { checkBlastRadius, getCodebaseMap, getSymbolDetails, lookupDictionary } from '../src/tools.js';
+import { checkBlastRadius, getCodebaseMap, getSymbolDetails, lookupDictionary, traceFlow } from '../src/tools.js';
 
 let engine: ParserEngine;
 
@@ -118,6 +118,114 @@ describe('check_blast_radius', () => {
       assert.match(out2, /normalize/);
       assert.match(checkBlastRadius(db, { symbol_name: 'zzz' }), /No symbol matching/);
       assert.match(checkBlastRadius(db, { symbol_name: '  ' }), /Empty symbol_name/);
+    } finally {
+      db.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+function seedFlow(): { root: string; db: ArgusDb } {
+  const root = mkdtempSync(join(tmpdir(), 'argus-trace-'));
+  writeFileSync(
+    join(root, 'flow.ts'),
+    `export function checkout(cart: string): string {
+  return pay(cart);
+}
+export function pay(cart: string): string {
+  return charge(cart);
+}
+function charge(cart: string): string {
+  return cart;
+}
+export function ping(): string {
+  return pong();
+}
+function pong(): string {
+  return ping();
+}
+export function submit(order: string): string {
+  return save(order);
+}
+export class CartStore {
+  save(order: string): string {
+    return order;
+  }
+}
+export class OrderStore {
+  save(order: string): string {
+    return order;
+  }
+}
+export function loadRemote(url: string): Promise<string> {
+  return fetch(url).then((r) => r.text());
+}
+`,
+  );
+  const db = new ArgusDb(':memory:');
+  syncRoot(db, engine, root);
+  return { root, db };
+}
+
+describe('trace_flow', () => {
+  it('walks a chain with depths and endpoints', () => {
+    const { root, db } = seedFlow();
+    try {
+      const out = traceFlow(db, { symbol_name: 'checkout' });
+      assert.match(out, /Trace from 'checkout'/);
+      assert.match(out, /\[d1\] checkout --calls--> pay \[EXTRACTED\]/);
+      assert.match(out, /\[d2\] pay --calls--> charge \[EXTRACTED\]/);
+      assert.match(out, /Endpoints \(1\):/);
+      assert.match(out, /charge flow\.ts/);
+    } finally {
+      db.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('honors max_depth and reports unresolved externals', () => {
+    const { root, db } = seedFlow();
+    try {
+      const shallow = traceFlow(db, { symbol_name: 'checkout', max_depth: 1 });
+      assert.match(shallow, /pay/);
+      assert.doesNotMatch(shallow, /charge/);
+      const ext = traceFlow(db, { symbol_name: 'loadRemote' });
+      assert.match(ext, /Unresolved \(/);
+      assert.match(ext, /fetch/);
+    } finally {
+      db.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('lists ambiguous callees without expanding them', () => {
+    const { root, db } = seedFlow();
+    try {
+      const out = traceFlow(db, { symbol_name: 'submit' });
+      assert.match(out, /\[d1\] submit --calls--> save \[AMBIGUOUS\]/);
+      assert.match(out, /Ambiguous, not expanded \(1\):/);
+      assert.match(out, /save \(e\.g\. flow\.ts:\d+, flow\.ts:\d+\)/);
+      assert.doesNotMatch(out, /\[d2\]/);
+    } finally {
+      db.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('terminates on cycles and rejects bad entries', () => {
+    const { root, db } = seedFlow();
+    try {
+      const out = traceFlow(db, { symbol_name: 'ping', max_depth: 6 });
+      assert.match(out, /\[d1\] ping --calls--> pong/);
+      assert.match(out, /already visited/);
+      assert.match(traceFlow(db, { symbol_name: 'zzz' }), /No symbol matching/);
+      assert.match(traceFlow(db, {}), /Pass symbol_name or symbol_id/);
+      assert.match(traceFlow(db, { symbol_id: -1 }), /Invalid symbol_id/);
+      assert.match(traceFlow(db, { symbol_id: 9999 }), /No symbol with id/);
+      assert.match(traceFlow(db, { symbol_name: 'save' }), /No exact match/);
+      const [row] = db.symbolsByNameExact('checkout');
+      assert.ok(row);
+      assert.match(traceFlow(db, { symbol_id: row.id }), /Trace from 'checkout'/);
     } finally {
       db.close();
       rmSync(root, { recursive: true, force: true });

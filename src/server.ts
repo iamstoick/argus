@@ -13,6 +13,7 @@ import {
   getSymbolDetails,
   lookupDictionary,
   lookupDictionaryHybrid,
+  traceFlow,
   type HybridStats,
 } from './tools.js';
 
@@ -204,6 +205,25 @@ export function createMcpServer(manager: IndexManager, version: string): McpServ
       Promise.resolve(
         withProject(manager, 'check_blast_radius', args.project, (entry) => checkBlastRadius(entry.db, args)),
       ),
+  );
+
+  server.registerTool(
+    'trace_flow',
+    {
+      description:
+        'Forward execution trace: walk outgoing calls from an entry symbol, depth-limited and confidence-labeled. ' +
+        'Ambiguous callees are reported, never expanded; external callees are reported as unresolved. ' +
+        'Use to explore what runs between an entry point and its downstream effects.',
+      inputSchema: {
+        symbol_name: z.string().optional().describe('Entry symbol (exact name preferred)'),
+        symbol_id: z.number().optional().describe('Entry symbol id from lookup_dictionary (preferred when ambiguous)'),
+        max_depth: z.number().optional().describe('Max hop depth from the entry (default 4, max 8)'),
+        limit: z.number().optional().describe('Max symbols visited (default 50)'),
+        project: projectField,
+      },
+    },
+    (args) =>
+      Promise.resolve(withProject(manager, 'trace_flow', args.project, (entry) => traceFlow(entry.db, args))),
   );
 
   server.registerTool(

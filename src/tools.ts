@@ -297,6 +297,211 @@ export function blastRadiusData(db: ArgusDb, rawName: string, rawLimit: number |
   return { matched, outgoing, incoming, incomingTruncated: incoming.length >= limit };
 }
 
+export interface TraceArgs {
+  symbol_name?: string | undefined;
+  symbol_id?: number | undefined;
+  max_depth?: number | undefined;
+  limit?: number | undefined;
+}
+
+/** Default/max BFS depth for trace_flow (entry at depth 0, its callees at 1). */
+export const TRACE_DEFAULT_DEPTH = 4;
+export const TRACE_MAX_DEPTH = 8;
+
+function clampDepth(raw: number | undefined): number {
+  if (raw === undefined || !Number.isFinite(raw)) return TRACE_DEFAULT_DEPTH;
+  return Math.min(Math.max(1, Math.floor(raw)), TRACE_MAX_DEPTH);
+}
+
+export interface TraceHop {
+  depth: number;
+  callerName: string;
+  callerPath: string;
+  callerLine: number;
+  calleeName: string;
+  relationshipType: string;
+  effectiveConfidence: RelationshipConfidence;
+  /** The single resolved target, or undefined when external/ambiguous. */
+  target: SymbolRow | undefined;
+  /** Total resolution candidates (0 external, 1 resolved, 2+ ambiguous). */
+  candidates: number;
+  /** Sample definitions for ambiguous callees (up to 3). */
+  samples: SymbolRow[];
+  revisited: boolean;
+}
+
+export interface TraceData {
+  entry: SymbolRow;
+  maxDepth: number;
+  hops: TraceHop[];
+  endpoints: SymbolRow[];
+  unresolved: string[];
+  ambiguous: Array<{ name: string; samples: SymbolRow[] }>;
+  truncated: boolean;
+}
+
+function sampleRows(rows: SymbolRow[], n: number): SymbolRow[] {
+  return rows.slice(0, Math.max(0, n));
+}
+
+/**
+ * Forward execution trace: BFS from one entry symbol along outgoing calls
+ * edges. Ambiguous callees (shared names) are reported, never expanded;
+ * external callees (no definition) are reported as unresolved. Cyclic and
+ * revisited symbols are followed once.
+ */
+export function traceFlowData(db: ArgusDb, args: TraceArgs): TraceData | { error: string } {
+  let entry: SymbolRow | undefined;
+  if (args.symbol_id !== undefined) {
+    if (!Number.isInteger(args.symbol_id) || args.symbol_id <= 0) {
+      return { error: 'Invalid symbol_id: pass a positive integer.' };
+    }
+    entry = db.symbolById(args.symbol_id);
+    if (entry === undefined) return { error: `No symbol with id ${args.symbol_id}.` };
+  } else {
+    const name = args.symbol_name?.trim() ?? '';
+    if (name === '') return { error: 'Pass symbol_name or symbol_id.' };
+    const exact = db.symbolsByNameExact(name);
+    const single = exact.length === 1 ? exact[0] : undefined;
+    if (single !== undefined) {
+      entry = single;
+    } else if (exact.length > 1) {
+      return {
+        error:
+          `Ambiguous entry '${name}' (${exact.length} matches); refine with symbol_id:\n` +
+          exact.slice(0, 20).map(candidateLine).join('\n'),
+      };
+    } else {
+      const like = db.symbolsByNameLike(name, 21);
+      if (like.length === 0) return { error: `No symbol matching '${name}'.` };
+      const first = like[0];
+      if (like.length > 1 || first === undefined) {
+        return {
+          error:
+            `No exact match for '${name}'; closest (${like.length}):\n` +
+            like.slice(0, 20).map(candidateLine).join('\n'),
+        };
+      }
+      entry = first;
+    }
+  }
+  const start = entry;
+  const maxDepth = clampDepth(args.max_depth);
+  const budget = clampLimit(args.limit);
+  const cache = new Map<string, number>();
+  const visited = new Set<number>([start.id]);
+  const hops: TraceHop[] = [];
+  const endpoints: SymbolRow[] = [];
+  const unresolvedSeen = new Set<string>();
+  const unresolved: string[] = [];
+  const ambiguousSeen = new Set<string>();
+  const ambiguous: Array<{ name: string; samples: SymbolRow[] }> = [];
+  let truncated = false;
+  const queue: Array<{ row: SymbolRow; depth: number }> = [{ row: start, depth: 0 }];
+  while (queue.length > 0) {
+    const current = queue.shift();
+    if (current === undefined) break;
+    const edges = db.outgoing([current.row.id]).slice(0, budget);
+    if (edges.length === 0 && current.depth > 0) endpoints.push(current.row);
+    if (current.depth >= maxDepth) continue;
+    for (const rel of edges) {
+      const confidence = edgeConfidence(db, rel, cache);
+      const simple = simpleName(rel.callee_name);
+      const count = db.countSymbolsBySimpleName(simple);
+      const hop = {
+        depth: current.depth + 1,
+        callerName: rel.caller_name,
+        callerPath: rel.caller_path,
+        callerLine: rel.caller_line,
+        calleeName: rel.callee_name,
+        relationshipType: rel.relationship_type,
+        effectiveConfidence: confidence,
+      };
+      if (count === 0) {
+        if (!unresolvedSeen.has(rel.callee_name)) {
+          unresolvedSeen.add(rel.callee_name);
+          unresolved.push(rel.callee_name);
+        }
+        hops.push({ ...hop, target: undefined, candidates: 0, samples: [], revisited: false });
+        continue;
+      }
+      const exactRows = db.symbolsByNameExact(rel.callee_name);
+      const singleExact = exactRows.length === 1 ? exactRows[0] : undefined;
+      const candidates: SymbolRow[] =
+        singleExact !== undefined && count === 1
+          ? [singleExact]
+          : db
+              .symbolsByNameLike(simple, 50)
+              .filter((r) => r.name === simple || r.name.endsWith(`.${simple}`));
+      const target = candidates.length === 1 ? candidates[0] : undefined;
+      if (target === undefined) {
+        if (!ambiguousSeen.has(rel.callee_name)) {
+          ambiguousSeen.add(rel.callee_name);
+          ambiguous.push({ name: rel.callee_name, samples: sampleRows(candidates, 3) });
+        }
+        hops.push({
+          ...hop,
+          target: undefined,
+          candidates: candidates.length,
+          samples: sampleRows(candidates, 3),
+          revisited: false,
+        });
+        continue;
+      }
+      const revisited = visited.has(target.id);
+      hops.push({ ...hop, target, candidates: 1, samples: [], revisited });
+      if (revisited) continue;
+      if (visited.size >= budget) {
+        truncated = true;
+        continue;
+      }
+      visited.add(target.id);
+      queue.push({ row: target, depth: current.depth + 1 });
+    }
+  }
+  return { entry: start, maxDepth, hops, endpoints, unresolved, ambiguous, truncated };
+}
+
+export function traceFlow(db: ArgusDb, args: TraceArgs): string {
+  const data = traceFlowData(db, args);
+  if ('error' in data) return data.error;
+  const out: string[] = [];
+  out.push(
+    `Trace from '${data.entry.name}' (#${data.entry.id} ${data.entry.path}:${data.entry.start_line}), max depth ${data.maxDepth}:`,
+  );
+  if (data.hops.length === 0) out.push('  (no outgoing calls recorded)');
+  for (const hop of data.hops) {
+    const target =
+      hop.target !== undefined
+        ? ` => ${hop.target.path}:${hop.target.start_line}`
+        : hop.candidates === 0
+          ? ' => unresolved (no definition in index: external or framework-wired)'
+          : ` => ambiguous (${hop.candidates} candidates; not expanded)`;
+    out.push(
+      `  [d${hop.depth}] ${hop.callerName} --${hop.relationshipType}--> ${hop.calleeName} [${hop.effectiveConfidence}] (${hop.callerPath}:${hop.callerLine})${target}${hop.revisited ? ' (already visited)' : ''}`,
+    );
+  }
+  if (data.endpoints.length > 0) {
+    out.push('', `Endpoints (${data.endpoints.length}):`);
+    for (const row of data.endpoints.slice(0, 20)) out.push(`  ${row.name} ${row.path}:${row.start_line}`);
+  }
+  if (data.unresolved.length > 0) {
+    out.push('', `Unresolved (${data.unresolved.length}): ${data.unresolved.slice(0, 20).join(', ')}`);
+  }
+  if (data.ambiguous.length > 0) {
+    out.push('', `Ambiguous, not expanded (${data.ambiguous.length}):`);
+    for (const group of data.ambiguous.slice(0, 20)) {
+      const samples = group.samples.map((r) => `${r.path}:${r.start_line}`).join(', ');
+      out.push(`  ${group.name}${samples === '' ? '' : ` (e.g. ${samples})`}`);
+    }
+  }
+  if (data.truncated) out.push('', 'Truncated: node budget reached; narrow the entry or raise limit.');
+  out.push(
+    'Confidence: EXTRACTED = direct syntactic ref; INFERRED = member call matched by name; AMBIGUOUS = unresolved or shared name.',
+  );
+  return truncateOutput(out.join('\n'));
+}
+
 export function checkBlastRadius(db: ArgusDb, args: BlastArgs): string {
   const data = blastRadiusData(db, args.symbol_name, args.limit);
   if ('error' in data) return data.error;

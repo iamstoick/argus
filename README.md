@@ -421,7 +421,7 @@ a **new** code file. Mechanics, so there are no surprises:
 
 ## Tools
 
-Eight tools, all read-only against your source tree. Every tool also accepts
+Nine tools, all read-only against your source tree. Every tool also accepts
 the optional `project` selector on multi-project servers (see
 [Client setup](#client-setup)).
 
@@ -432,6 +432,7 @@ the optional `project` selector on multi-project servers (see
 | `get_project_brief` | `limit` (optional) | Orientation digest: size, languages, hubs, drift, audits, activity |
 | `get_symbol_details` | `symbol_id` or `symbol_name` | Exact source block for one symbol |
 | `check_blast_radius` | `symbol_name`, `limit` (optional) | Incoming dependents + outgoing dependencies |
+| `trace_flow` | `symbol_name`/`symbol_id`, `max_depth`, `limit` (all optional) | Forward call trace from an entry symbol |
 | `find_duplicates` | `limit` (optional) | Symbols sharing normalized name + signature |
 | `find_dead_code` | `include_exported` (optional), `limit` (optional) | Symbols nothing calls (conservative) |
 | `diff_snapshots` | `from`/`to` (optional), `take` (optional), `limit` (optional) | Symbols added, removed, or signature-changed between snapshots |
@@ -489,6 +490,18 @@ deduped, with a `+` marker when the limit cut the list). Every edge carries a
 confidence tag: `[EXTRACTED]` (direct syntactic ref), `[INFERRED]` (member
 call rebound by simple name), `[AMBIGUOUS]` (unresolved or shared by several
 symbols). Always call this before renaming or re-signaturing.
+
+### `trace_flow`
+
+Breadth-first walk from one entry symbol along outgoing `calls` edges
+(default depth 4, max 8; entry at depth 0). Hops print depth-ordered with
+the same confidence tags as blast radius. Ambiguous callees (shared names)
+are listed with sample definitions but never expanded; external callees
+(framework-wired or undefined) land in an unresolved list; revisited
+symbols are followed once so cycles terminate. A trailing section names
+reached endpoints, and truncation says so instead of silently stopping.
+`symbol_id` wins when both selectors are passed; an ambiguous or unmatched
+name reports candidates instead of guessing.
 
 ### `find_duplicates`
 
